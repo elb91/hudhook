@@ -1,3 +1,4 @@
+// hudhook/src/hooks/dx12.rs
 //! Hooks for DirectX 12.
 
 use std::ffi::c_void;
@@ -65,7 +66,6 @@ enum InitializationContext {
 }
 
 impl InitializationContext {
-    // Transition to a state where the swap chain is set. Ignore other mutations.
     fn insert_swap_chain(&mut self, swap_chain: &IDXGISwapChain3) {
         *self = match mem::replace(self, InitializationContext::Empty) {
             InitializationContext::Empty => {
@@ -75,18 +75,22 @@ impl InitializationContext {
         }
     }
 
-    // Transition to a complete state if the swap chain is set and the command queue
-    // is associated with it.
+    // MODIFIED: Check if this is the real swapchain queue
     fn insert_command_queue(&mut self, command_queue: &ID3D12CommandQueue) {
         *self = match mem::replace(self, InitializationContext::Empty) {
             InitializationContext::WithSwapChain(swap_chain) => {
-                if unsafe { Self::check_command_queue(&swap_chain, command_queue) } {
+                let queue_ptr = command_queue.as_raw() as usize;
+                
+                // Check if this is the swapchain queue (CommandQueue #3)
+                if unsafe { Self::is_swapchain_queue(queue_ptr) } {
                     trace!(
-                        "Found command queue matching swap chain {swap_chain:?} at \
-                         {command_queue:?}"
+                        "Found swapchain CommandQueue at 0x{:x} for swap chain {:?}",
+                        queue_ptr,
+                        swap_chain
                     );
                     InitializationContext::Complete(swap_chain, command_queue.clone())
                 } else {
+                    // Not the right queue, keep waiting
                     InitializationContext::WithSwapChain(swap_chain)
                 }
             },
@@ -94,7 +98,6 @@ impl InitializationContext {
         }
     }
 
-    // Retrieve the values if the context is complete.
     fn get(&self) -> Option<(IDXGISwapChain3, ID3D12CommandQueue)> {
         if let InitializationContext::Complete(swap_chain, command_queue) = self {
             Some((swap_chain.clone(), command_queue.clone()))
@@ -103,37 +106,19 @@ impl InitializationContext {
         }
     }
 
-    // Mark the context as done so no further operations are executed on it.
     fn done(&mut self) {
         if let InitializationContext::Complete(..) = self {
             *self = InitializationContext::Done;
         }
     }
 
-    unsafe fn check_command_queue(
-        swap_chain: &IDXGISwapChain3,
-        command_queue: &ID3D12CommandQueue,
-    ) -> bool {
-        let swap_chain_ptr = swap_chain.as_raw() as *mut *mut c_void;
-        let readable_ptrs = util::readable_region(swap_chain_ptr, 512);
-
-        match readable_ptrs.iter().position(|&ptr| std::ptr::eq(ptr, command_queue.as_raw())) {
-            Some(idx) => {
-                debug!(
-                    "Found command queue pointer in swap chain struct at offset +0x{:x}",
-                    idx * mem::size_of::<usize>(),
-                );
-                true
-            },
-            None => {
-                warn!(
-                    "Couldn't find command queue pointer in swap chain struct ({} out of 512 \
-                     pointers were readable)",
-                    readable_ptrs.len()
-                );
-                false
-            },
+    // NEW: Call into d3d12_hook to check if this is the swapchain queue
+    unsafe fn is_swapchain_queue(queue_ptr: usize) -> bool {
+        // This will be resolved at link time to your d3d12_hook module
+        extern "Rust" {
+            fn is_swapchain_queue(queue_ptr: usize) -> bool;
         }
+        is_swapchain_queue(queue_ptr)
     }
 }
 
@@ -399,7 +384,7 @@ impl Hooks for ImguiDx12Hooks {
     unsafe fn unhook(&mut self) {
         TRAMPOLINES.take();
         PIPELINE.take().map(|p| p.into_inner().take());
-        RENDER_LOOP.take(); // should already be null
+        RENDER_LOOP.take();
 
         *INITIALIZATION_CONTEXT.lock() = InitializationContext::Empty;
     }
