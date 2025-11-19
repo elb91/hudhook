@@ -941,7 +941,7 @@ impl TextureHeap {
         // points to a double-free, but I don't know why: upload_buffer should
         // stay alive with a positive refcount until the end of this block.
         // let _ = ManuallyDrop::into_inner(src_location.pResource);
-        let _ = ManuallyDrop::into_inner(dst_location.pResource);
+       // let _ = ManuallyDrop::into_inner(dst_location.pResource);
 
         Ok(())
     }
