@@ -1,7 +1,7 @@
 //! Hooks for DirectX 12.
 //! 
-//!  Key improvements:
-//! - Command queue selection by num_command_lists (game uses 5+, test uses 1)
+//! Key improvements:
+//! - Timing-based queue selection (capture first DIRECT queue after init)
 //! - Command queue persists across swap chain changes
 //! - Safe resource cleanup
 //! - No COM object cloning
@@ -61,6 +61,7 @@ struct Trampolines {
 }
 
 static mut TRAMPOLINES: OnceLock<Trampolines> = OnceLock::new();
+static VTABLE_INIT_DONE: AtomicBool = AtomicBool::new(false);
 
 // State per render thread using thread_local
 struct RenderState {
@@ -326,23 +327,23 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
 ) {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    // Capture DIRECT command queues that submit 5+ lists (real game queues)
-    // Our test queue only submits 1 list, so we skip it
-    RENDER_STATE.with(|state_cell| {
-        if let Ok(mut state) = state_cell.try_borrow_mut() {
-            let desc = command_queue.GetDesc();
-            
-            if desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT && state.command_queue_ptr.is_null() {
-                // Game queues typically submit 5+ command lists
-                // Our dummy test queue only submits 1
-                if num_command_lists >= 5 {
+    // Only capture queues AFTER vtable initialization is complete
+    // This ensures we skip our dummy test queue
+    if VTABLE_INIT_DONE.load(Ordering::Acquire) {
+        RENDER_STATE.with(|state_cell| {
+            if let Ok(mut state) = state_cell.try_borrow_mut() {
+                let desc = command_queue.GetDesc();
+                
+                // Capture the FIRST DIRECT queue we see after init
+                // (matches what the working tool does)
+                if desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT && state.command_queue_ptr.is_null() {
                     let queue_ptr = command_queue.as_raw() as *mut c_void;
-                    debug!("Captured command queue (lists: {})", num_command_lists);
+                    debug!("Captured first DIRECT command queue (lists: {})", num_command_lists);
                     state.command_queue_ptr = queue_ptr;
                 }
             }
-        }
-    });
+        });
+    }
 
     let Trampolines { d3d12_command_queue_execute_command_lists, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
@@ -425,6 +426,10 @@ fn get_target_addrs() -> (
         debug!("  Present: {:p}", present_ptr as *const c_void);
         debug!("  ResizeBuffers: {:p}", resize_buffers_ptr as *const c_void);
         debug!("  ExecuteCommandLists: {:p}", execute_command_lists_ptr as *const c_void);
+        
+        // Mark that vtable initialization is complete
+        // Any ExecuteCommandLists calls after this point are from the game
+        VTABLE_INIT_DONE.store(true, Ordering::Release);
         
         (
             mem::transmute(present_ptr),
