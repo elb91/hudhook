@@ -315,12 +315,8 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
     command_lists: *mut ID3D12CommandList,
 ) {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
-    trace!(
-        "ID3D12CommandQueue::ExecuteCommandLists({command_queue:?}, {num_command_lists}, \
-         {command_lists:p}) invoked",
-    );
-
-    // Store DIRECT command queue with Priority 5 (main rendering queue)
+    
+    // Store DIRECT command queue - prefer priority 5, but accept priority 1 as fallback
     RENDER_STATE.with(|state_cell| {
         if let Ok(mut state) = state_cell.try_borrow_mut() {
             let desc = command_queue.GetDesc();
@@ -328,17 +324,39 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
             if desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT {
                 let priority = desc.Priority;
                 
-                // Log all command queues for debugging
-                trace!("CommandQueue detected - Priority: {}, Address: {:?}", priority, command_queue);
-                
-                // Only capture queue with priority 5 (main rendering queue)
-                if priority == 5 {
-                    if state.command_queue.is_none() {
-                        debug!("✓ Captured DIRECT command queue with Priority 5: {:?}", command_queue);
-                        state.command_queue = Some(command_queue.clone());
+                match state.command_queue.as_ref() {
+                    None => {
+                        // No queue captured yet - accept priority 1 or 5
+                        if priority == 1 || priority == 5 {
+                            debug!("✓ Captured DIRECT command queue - Priority: {}, Address: {:?}", 
+                                   priority, command_queue);
+                            state.command_queue = Some(command_queue.clone());
+                        } else {
+                            trace!("Skipping queue with priority {} (waiting for 1 or 5)", priority);
+                        }
+                    },
+                    Some(existing) => {
+                        let existing_desc = existing.GetDesc();
+                        let existing_priority = existing_desc.Priority;
+                        
+                        // If we have priority 1 but see priority 5, upgrade to priority 5
+                        if existing_priority == 1 && priority == 5 {
+                            debug!("⬆ Upgrading from Priority {} to Priority {} queue: {:?}", 
+                                   existing_priority, priority, command_queue);
+                            state.command_queue = Some(command_queue.clone());
+                        } else if existing_priority != 5 && existing_priority != 1 {
+                            // If we somehow captured wrong priority, replace with 1 or 5
+                            if priority == 1 || priority == 5 {
+                                debug!("⚠ Replacing Priority {} with Priority {} queue: {:?}", 
+                                       existing_priority, priority, command_queue);
+                                state.command_queue = Some(command_queue.clone());
+                            }
+                        } else {
+                            // Log all other queues at trace level for debugging
+                            trace!("Keeping Priority {} queue, saw Priority {} queue", 
+                                   existing_priority, priority);
+                        }
                     }
-                } else {
-                    trace!("Skipping queue with priority {} (need priority 5)", priority);
                 }
             }
         }
