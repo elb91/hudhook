@@ -320,14 +320,25 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
          {command_lists:p}) invoked",
     );
 
-    // Store DIRECT command queue
+    // Store DIRECT command queue with Priority 5 (main rendering queue)
     RENDER_STATE.with(|state_cell| {
         if let Ok(mut state) = state_cell.try_borrow_mut() {
-            if state.command_queue.is_none() {
-                let desc = command_queue.GetDesc();
-                if desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT {
-                    debug!("Captured DIRECT command queue: {:?}", command_queue);
-                    state.command_queue = Some(command_queue.clone());
+            let desc = command_queue.GetDesc();
+            
+            if desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT {
+                let priority = desc.Priority;
+                
+                // Log all command queues for debugging
+                trace!("CommandQueue detected - Priority: {}, Address: {:?}", priority, command_queue);
+                
+                // Only capture queue with priority 5 (main rendering queue)
+                if priority == 5 {
+                    if state.command_queue.is_none() {
+                        debug!("✓ Captured DIRECT command queue with Priority 5: {:?}", command_queue);
+                        state.command_queue = Some(command_queue.clone());
+                    }
+                } else {
+                    trace!("Skipping queue with priority {} (need priority 5)", priority);
                 }
             }
         }
@@ -338,7 +349,6 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
 
     d3d12_command_queue_execute_command_lists(command_queue, num_command_lists, command_lists);
 }
-
 fn get_target_addrs() -> (
     DXGISwapChainPresentType,
     DXGISwapChainResizeBuffersType,
