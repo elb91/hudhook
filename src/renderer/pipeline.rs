@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::mem;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use imgui::Context;
 use once_cell::sync::{Lazy, OnceCell};
 use parking_lot::Mutex;
-use tracing::{error, debug};
+use tracing::error;
 use windows::core::{Error, Result, HRESULT};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -16,26 +18,27 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_RBUTTONDOWN, WM_RBUTTONUP,
 };
 
-use crate::renderer::input::WndProcType;
+use crate::renderer::input::{imgui_wnd_proc_impl, WndProcType};
 use crate::renderer::RenderEngine;
 use crate::{util, ImguiRenderLoop, MessageFilter};
 
 type RenderLoop = Box<dyn ImguiRenderLoop + Send + Sync>;
 
-// Shared state accessible from window procedure
 static PIPELINE_STATES: Lazy<Mutex<HashMap<isize, Arc<PipelineSharedState>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-// Store Context pointers (unsafe but controlled)
-struct ContextPtr(*mut Context);
-unsafe impl Send for ContextPtr {}
-unsafe impl Sync for ContextPtr {}
-
-static PIPELINE_CONTEXTS: Lazy<Mutex<HashMap<isize, ContextPtr>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+#[derive(Debug)]
+pub(crate) struct PipelineMessage(
+    pub(crate) HWND,
+    pub(crate) u32,
+    pub(crate) WPARAM,
+    pub(crate) LPARAM,
+);
 
 pub(crate) struct PipelineSharedState {
+    pub(crate) message_filter: AtomicU32,
     pub(crate) wnd_proc: WndProcType,
+    pub(crate) tx: Sender<PipelineMessage>,
 }
 
 pub(crate) struct Pipeline<T: RenderEngine> {
@@ -43,7 +46,9 @@ pub(crate) struct Pipeline<T: RenderEngine> {
     ctx: Context,
     engine: T,
     render_loop: RenderLoop,
+    rx: Receiver<PipelineMessage>,
     shared_state: Arc<PipelineSharedState>,
+    queue_buffer: OnceCell<Vec<PipelineMessage>>,
     start_of_first_frame: OnceCell<Instant>,
 }
 
@@ -77,24 +82,45 @@ impl<T: RenderEngine> Pipeline<T> {
             ))
         };
 
-        let shared_state = Arc::new(PipelineSharedState { wnd_proc });
+        let (tx, rx) = mpsc::channel();
+        let shared_state = Arc::new(PipelineSharedState {
+            // Start with blocking all input by default
+            // This prevents race condition where messages arrive before first frame
+            message_filter: AtomicU32::new(MessageFilter::all().bits()),
+            wnd_proc,
+            tx,
+        });
 
         PIPELINE_STATES.lock().insert(hwnd.0, Arc::clone(&shared_state));
+
+        let queue_buffer = OnceCell::from(Vec::new());
 
         Ok(Self {
             hwnd,
             ctx,
             engine,
             render_loop,
+            rx,
             shared_state: Arc::clone(&shared_state),
+            queue_buffer,
             start_of_first_frame: OnceCell::new(),
         })
     }
 
     pub(crate) fn prepare_render(&mut self) -> Result<()> {
-        // Store pointer to context for WndProc access
-        let ctx_ptr = &mut self.ctx as *mut Context;
-        PIPELINE_CONTEXTS.lock().insert(self.hwnd.0, ContextPtr(ctx_ptr));
+        // Process messages BEFORE updating filter
+        // This ensures we process messages from previous frame before making new decisions
+        let mut queue_buffer = self.queue_buffer.take().unwrap();
+        queue_buffer.clear();
+        queue_buffer.extend(self.rx.try_iter());
+        queue_buffer.drain(..).for_each(|PipelineMessage(hwnd, umsg, wparam, lparam)| {
+            imgui_wnd_proc_impl(hwnd, umsg, wparam, lparam, self);
+        });
+        self.queue_buffer.set(queue_buffer).expect("OnceCell should be empty");
+
+        // Now update message filter for THIS frame
+        let message_filter = self.render_loop.message_filter(self.ctx.io());
+        self.shared_state.message_filter.store(message_filter.bits(), Ordering::SeqCst);
 
         let io = self.ctx.io_mut();
         io.nav_active = true;
@@ -127,9 +153,6 @@ impl<T: RenderEngine> Pipeline<T> {
         let draw_data = self.ctx.render();
 
         self.engine.render(draw_data, render_target)?;
-        
-        // Remove context pointer after render
-        PIPELINE_CONTEXTS.lock().remove(&self.hwnd.0);
 
         Ok(())
     }
@@ -147,9 +170,6 @@ impl<T: RenderEngine> Pipeline<T> {
     }
 
     pub(crate) fn cleanup(&mut self) {
-        PIPELINE_STATES.lock().remove(&self.hwnd.0);
-        PIPELINE_CONTEXTS.lock().remove(&self.hwnd.0);
-        
         unsafe {
             SetWindowLongPtrW(self.hwnd, GWLP_WNDPROC, self.shared_state.wnd_proc as usize as _)
         };
@@ -161,200 +181,48 @@ impl<T: RenderEngine> Pipeline<T> {
     }
 }
 
-// Process messages synchronously
+// Conservative blocking approach
 unsafe extern "system" fn pipeline_wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    // Get shared state for original wnd proc
     let shared_state = {
         let Some(shared_state_guard) = PIPELINE_STATES.try_lock() else {
-            return DefWindowProcW(hwnd, msg, wparam, lparam);
+            error!("Could not lock shared state in window procedure");
+            // Block input when we can't access state
+            return match msg {
+                WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP |
+                WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MOUSEWHEEL | WM_MOUSEMOVE |
+                WM_KEYDOWN | WM_KEYUP | WM_CHAR => LRESULT(1),
+                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+            };
         };
 
         let Some(shared_state) = shared_state_guard.get(&hwnd.0) else {
+            error!("Could not get shared state for handle {hwnd:?}");
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         };
 
         Arc::clone(shared_state)
     };
 
-    // Try to get context pointer
-    let ctx_ptr = PIPELINE_CONTEXTS.lock().get(&hwnd.0).map(|p| p.0);
+    // Always queue the message for processing
+    if let Err(e) = shared_state.tx.send(PipelineMessage(hwnd, msg, wparam, lparam)) {
+        error!("Could not send window message through pipeline: {e:?}");
+    }
 
-    // If we have context, process message synchronously
-    if let Some(ctx_ptr) = ctx_ptr {
-        let ctx = &mut *ctx_ptr;
-        
-        // Update ImGui with this message
-        process_imgui_message(ctx, msg, wparam, lparam);
-        
-        // Make decision with CURRENT state
-        let io = ctx.io();
-        let should_block = match msg {
-            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP |
-            WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MOUSEWHEEL | WM_MOUSEMOVE => {
-                io.want_capture_mouse
-            }
-            WM_KEYDOWN | WM_KEYUP | WM_CHAR => {
-                io.want_capture_keyboard
-            }
-            _ => false,
-        };
-        
-        if should_block {
-            return LRESULT(1);
-        }
+    // Get current message filter
+    let message_filter =
+        MessageFilter::from_bits_retain(shared_state.message_filter.load(Ordering::SeqCst));
+
+    // The filter is from the PREVIOUS frame, but that's OK
+    // It's conservative - if UI wanted input last frame, block this frame too
+    // Better to be slightly late blocking than to leak clicks to game
+    if message_filter.is_blocking(msg) {
+        LRESULT(1)
     } else {
-        // Conservative: block input when context not available
-        match msg {
-            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP |
-            WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MOUSEWHEEL | WM_MOUSEMOVE |
-            WM_KEYDOWN | WM_KEYUP | WM_CHAR => {
-                return LRESULT(1);
-            }
-            _ => {}
-        }
+        CallWindowProcW(Some(shared_state.wnd_proc), hwnd, msg, wparam, lparam)
     }
-
-    // Forward to original window procedure
-    CallWindowProcW(Some(shared_state.wnd_proc), hwnd, msg, wparam, lparam)
-}
-
-// Process Windows message and update ImGui
-unsafe fn process_imgui_message(
-    ctx: &mut Context,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) {
-    let io = ctx.io_mut();
-    
-    match msg {
-        WM_LBUTTONDOWN => {
-            io.add_mouse_button_event(imgui::MouseButton::Left, true);
-        }
-        WM_LBUTTONUP => {
-            io.add_mouse_button_event(imgui::MouseButton::Left, false);
-        }
-        WM_RBUTTONDOWN => {
-            io.add_mouse_button_event(imgui::MouseButton::Right, true);
-        }
-        WM_RBUTTONUP => {
-            io.add_mouse_button_event(imgui::MouseButton::Right, false);
-        }
-        WM_MBUTTONDOWN => {
-            io.add_mouse_button_event(imgui::MouseButton::Middle, true);
-        }
-        WM_MBUTTONUP => {
-            io.add_mouse_button_event(imgui::MouseButton::Middle, false);
-        }
-        WM_MOUSEWHEEL => {
-            let wheel_delta = ((wparam.0 >> 16) & 0xffff) as i16 as f32 / 120.0;
-            io.add_mouse_wheel_event([0.0, wheel_delta]);
-        }
-        WM_MOUSEMOVE => {
-            let x = (lparam.0 & 0xffff) as i16 as f32;
-            let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32;
-            io.add_mouse_pos_event([x, y]);
-        }
-        WM_KEYDOWN | WM_KEYUP => {
-            let vk = wparam.0 as i32;
-            let is_down = msg == WM_KEYDOWN;
-            if vk < 256 {
-                if let Some(key) = vk_to_imgui_key(vk) {
-                    io.add_key_event(key, is_down);
-                }
-            }
-        }
-        WM_CHAR => {
-            if wparam.0 > 0 && wparam.0 < 0x10000 {
-                if let Some(c) = char::from_u32(wparam.0 as u32) {
-                    io.add_input_character(c);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-// Convert VK codes to ImGui keys
-fn vk_to_imgui_key(vk: i32) -> Option<imgui::Key> {
-    use imgui::Key;
-    Some(match vk {
-        0x09 => Key::Tab,
-        0x25 => Key::LeftArrow,
-        0x26 => Key::UpArrow,
-        0x27 => Key::RightArrow,
-        0x28 => Key::DownArrow,
-        0x21 => Key::PageUp,
-        0x22 => Key::PageDown,
-        0x24 => Key::Home,
-        0x23 => Key::End,
-        0x2D => Key::Insert,
-        0x2E => Key::Delete,
-        0x08 => Key::Backspace,
-        0x20 => Key::Space,
-        0x0D => Key::Enter,
-        0x1B => Key::Escape,
-        0x11 | 0xA2 => Key::LeftCtrl,
-        0xA3 => Key::RightCtrl,
-        0x10 | 0xA0 => Key::LeftShift,
-        0xA1 => Key::RightShift,
-        0x12 | 0xA4 => Key::LeftAlt,
-        0xA5 => Key::RightAlt,
-        0x5B => Key::LeftSuper,
-        0x5C => Key::RightSuper,
-        0x30 => Key::Alpha0,
-        0x31 => Key::Alpha1,
-        0x32 => Key::Alpha2,
-        0x33 => Key::Alpha3,
-        0x34 => Key::Alpha4,
-        0x35 => Key::Alpha5,
-        0x36 => Key::Alpha6,
-        0x37 => Key::Alpha7,
-        0x38 => Key::Alpha8,
-        0x39 => Key::Alpha9,
-        0x41 => Key::A,
-        0x42 => Key::B,
-        0x43 => Key::C,
-        0x44 => Key::D,
-        0x45 => Key::E,
-        0x46 => Key::F,
-        0x47 => Key::G,
-        0x48 => Key::H,
-        0x49 => Key::I,
-        0x4A => Key::J,
-        0x4B => Key::K,
-        0x4C => Key::L,
-        0x4D => Key::M,
-        0x4E => Key::N,
-        0x4F => Key::O,
-        0x50 => Key::P,
-        0x51 => Key::Q,
-        0x52 => Key::R,
-        0x53 => Key::S,
-        0x54 => Key::T,
-        0x55 => Key::U,
-        0x56 => Key::V,
-        0x57 => Key::W,
-        0x58 => Key::X,
-        0x59 => Key::Y,
-        0x5A => Key::Z,
-        0x70 => Key::F1,
-        0x71 => Key::F2,
-        0x72 => Key::F3,
-        0x73 => Key::F4,
-        0x74 => Key::F5,
-        0x75 => Key::F6,
-        0x76 => Key::F7,
-        0x77 => Key::F8,
-        0x78 => Key::F9,
-        0x79 => Key::F10,
-        0x7A => Key::F11,
-        0x7B => Key::F12,
-        _ => return None,
-    })
 }
