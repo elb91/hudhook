@@ -219,6 +219,8 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
     flags: u32,
 ) -> HRESULT {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
+    
+    // Insert swap chain
     {
         INITIALIZATION_CONTEXT.lock().insert_swap_chain(&swap_chain);
     }
@@ -226,20 +228,38 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
     let Trampolines { dxgi_swap_chain_present, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
 
-    //  Check if initialization is complete before trying to render
-    let is_ready = {
-        INITIALIZATION_CONTEXT.lock().get().is_some()
+    // Check initialization status with detailed logging
+    let init_status = {
+        let ctx = INITIALIZATION_CONTEXT.lock();
+        match &*ctx {
+            InitializationContext::Empty => "Empty",
+            InitializationContext::WithSwapChain(_) => "WithSwapChain",
+            InitializationContext::Complete(_, _) => "Complete",
+            InitializationContext::Done => "Done",
+        }
     };
     
-    if is_ready {
+    // Log every 60 frames
+    static mut FRAME_COUNT: u32 = 0;
+    FRAME_COUNT += 1;
+    if FRAME_COUNT % 60 == 0 {
+        debug!("Present frame {}: init_status={}", FRAME_COUNT, init_status);
+    }
+    
+    // Try to render if complete or done
+    let should_render = matches!(init_status, "Complete" | "Done");
+    
+    if should_render {
         if let Err(e) = render(&swap_chain) {
+            if FRAME_COUNT % 60 == 0 {
+                error!("Render error at frame {}: {e:?}", FRAME_COUNT);
+            }
             util::print_dxgi_debug_messages();
-            error!("Render error: {e:?}");
         }
     } else {
-        // Silently skip rendering until command queue is captured
-        // This is normal on first few frames
-        trace!("Skipping render - waiting for command queue");
+        if FRAME_COUNT % 60 == 0 {
+            trace!("Skipping render - init_status={}", init_status);
+        }
     }
 
     trace!("Call IDXGISwapChain::Present trampoline");
