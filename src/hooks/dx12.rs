@@ -362,45 +362,24 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
 ) {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    // ALWAYS log queue info for debugging
     let desc = command_queue.GetDesc();
     let priority = desc.Priority;
-    let queue_type = desc.Type;
     
-    // Log EVERY queue we see (not just DIRECT)
     debug!("ExecuteCommandLists called: Type={:?}, Priority={}, Lists={}", 
-           queue_type, priority, num_command_lists);
+           desc.Type, priority, num_command_lists);
     
-    // Store DIRECT command queue - prefer priority 1 or 5, IGNORE priority 0
     RENDER_STATE.with(|state_cell| {
         if let Ok(mut state) = state_cell.try_borrow_mut() {
             if desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT {
                 let queue_ptr = command_queue.as_raw() as *mut c_void;
                 
-                //  Ignore priority 0 (our dummy queue from vtable extraction)
-                if priority == 0 {
-                    trace!("Ignoring Priority 0 queue (dummy/test queue)");
-                } else if state.command_queue_ptr.is_null() {
-                    // Accept any DIRECT queue with non-zero priority
-                    debug!("Captured command queue - Priority: {}, Address: {:?}", priority, queue_ptr);
+                // Skip single command list submissions (likely our dummy queue)
+                // Game typically submits multiple lists (5+)
+                if num_command_lists >= 5 && state.command_queue_ptr.is_null() {
+                    debug!("Captured DIRECT command queue - Lists: {}, Address: {:?}", num_command_lists, queue_ptr);
                     state.command_queue_ptr = queue_ptr;
-                } else {
-                    // Already have a queue - check if we should upgrade
-                    let existing_queue = ID3D12CommandQueue::from_raw(state.command_queue_ptr);
-                    let existing_desc = existing_queue.GetDesc();
-                    let existing_priority = existing_desc.Priority;
-                    
-                    // Prefer priority 5 (main rendering) or priority 1 (UI rendering)
-                    let should_upgrade = match (existing_priority, priority) {
-                        (_, 5) if existing_priority != 5 => true,
-                        (ep, 1) if ep > 5 => true,
-                        _ => false,
-                    };
-                    
-                    if should_upgrade {
-                        debug!("⬆ Upgrading from Priority {} to Priority {}", existing_priority, priority);
-                        state.command_queue_ptr = queue_ptr;
-                    }
+                } else if num_command_lists < 5 {
+                    trace!("Skipping queue with {} command lists (likely test queue)", num_command_lists);
                 }
             }
         }
