@@ -362,7 +362,7 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
 ) {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    // Store DIRECT command queue - prefer priority 1 or 5
+    // Store DIRECT command queue - prefer priority 1 or 5, IGNORE priority 0
     RENDER_STATE.with(|state_cell| {
         if let Ok(mut state) = state_cell.try_borrow_mut() {
             let desc = command_queue.GetDesc();
@@ -371,8 +371,12 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
                 let priority = desc.Priority;
                 let queue_ptr = command_queue.as_raw() as *mut c_void;
                 
-                if state.command_queue_ptr.is_null() {
-                    // Accept any DIRECT queue initially
+                // Ignore priority 0 (our dummy queue from vtable extraction)
+                if priority == 0 {
+                    trace!("Ignoring Priority 0 queue (dummy/test queue)");
+                    // Don't capture it - fall through to call original
+                } else if state.command_queue_ptr.is_null() {
+                    // Accept any DIRECT queue with non-zero priority
                     debug!(" Captured command queue - Priority: {}, Address: {:?}", priority, queue_ptr);
                     state.command_queue_ptr = queue_ptr;
                 } else {
@@ -404,7 +408,6 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
 
     d3d12_command_queue_execute_command_lists(command_queue, num_command_lists, command_lists);
 }
-
 fn get_target_addrs() -> (
     DXGISwapChainPresentType,
     DXGISwapChainResizeBuffersType,
