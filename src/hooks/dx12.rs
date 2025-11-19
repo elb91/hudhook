@@ -211,6 +211,27 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
 ) -> HRESULT {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
+    // Track swap chain pointer changes
+    static mut LAST_SWAP_CHAIN_PTR: *const c_void = std::ptr::null();
+    let current_ptr = swap_chain.as_raw() as *const c_void;
+    
+    if current_ptr != LAST_SWAP_CHAIN_PTR {
+        error!("!!! SWAP CHAIN POINTER CHANGED !!! Old: {:p}, New: {:p}", LAST_SWAP_CHAIN_PTR, current_ptr);
+        
+        // Reset everything like ResizeBuffers does
+        if let Some(pipeline) = PIPELINE.take() {
+            error!("Dropping pipeline due to swap chain change");
+            drop(pipeline);
+        }
+        
+        {
+            let mut ctx = INITIALIZATION_CONTEXT.lock();
+            ctx.reset();
+        }
+        
+        LAST_SWAP_CHAIN_PTR = current_ptr;
+    }
+    
     {
         INITIALIZATION_CONTEXT.lock().insert_swap_chain(&swap_chain);
     }
@@ -218,7 +239,6 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
     let Trampolines { dxgi_swap_chain_present, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
 
-    // Check if initialization is complete
     let is_ready = {
         let ctx = INITIALIZATION_CONTEXT.lock();
         matches!(&*ctx, InitializationContext::Complete(_, _) | InitializationContext::Done)
@@ -240,7 +260,6 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
 
     result
 }
-
 // Complete reset on ResizeBuffers (handles scene transitions)
 unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
     p_this: IDXGISwapChain3,
