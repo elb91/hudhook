@@ -94,7 +94,8 @@ impl InitializationContext {
                         "Ignoring command queue {:?} with type {:?} (not DIRECT)",
                         command_queue, desc.Type
                     );
-                    return InitializationContext::WithSwapChain(swap_chain);
+                   *self = InitializationContext::WithSwapChain(swap_chain);
+                    return;
                 }
                 
                 if unsafe { Self::check_command_queue(&swap_chain, command_queue) } {
