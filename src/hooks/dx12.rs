@@ -226,9 +226,20 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
     let Trampolines { dxgi_swap_chain_present, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
 
-    if let Err(e) = render(&swap_chain) {
-        util::print_dxgi_debug_messages();
-        error!("Render error: {e:?}");
+    //  Check if initialization is complete before trying to render
+    let is_ready = {
+        INITIALIZATION_CONTEXT.lock().get().is_some()
+    };
+    
+    if is_ready {
+        if let Err(e) = render(&swap_chain) {
+            util::print_dxgi_debug_messages();
+            error!("Render error: {e:?}");
+        }
+    } else {
+        // Silently skip rendering until command queue is captured
+        // This is normal on first few frames
+        trace!("Skipping render - waiting for command queue");
     }
 
     trace!("Call IDXGISwapChain::Present trampoline");
