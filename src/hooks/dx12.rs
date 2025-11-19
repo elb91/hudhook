@@ -211,25 +211,35 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
 ) -> HRESULT {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    // Track swap chain pointer changes
+    // Track swap chain changes
     static mut LAST_SWAP_CHAIN_PTR: *const c_void = std::ptr::null();
     let current_ptr = swap_chain.as_raw() as *const c_void;
     
     if current_ptr != LAST_SWAP_CHAIN_PTR {
-        error!("!!! SWAP CHAIN POINTER CHANGED !!! Old: {:p}, New: {:p}", LAST_SWAP_CHAIN_PTR, current_ptr);
+        error!("Swap chain changed: {:p} -> {:p}", LAST_SWAP_CHAIN_PTR, current_ptr);
         
-        // Reset everything like ResizeBuffers does
+        // Don't try to render for a few frames after swap chain change
+        // Give the game time to stabilize
+        static mut SKIP_FRAMES: u32 = 0;
+        SKIP_FRAMES = 10; // Skip next 10 frames
+        
         if let Some(pipeline) = PIPELINE.take() {
-            error!("Dropping pipeline due to swap chain change");
             drop(pipeline);
         }
         
-        {
-            let mut ctx = INITIALIZATION_CONTEXT.lock();
-            ctx.reset();
-        }
-        
+        INITIALIZATION_CONTEXT.lock().reset();
         LAST_SWAP_CHAIN_PTR = current_ptr;
+    }
+    
+    // Check if we should skip rendering
+    static mut SKIP_FRAMES: u32 = 0;
+    if SKIP_FRAMES > 0 {
+        SKIP_FRAMES -= 1;
+        trace!("Skipping render, {} frames remaining", SKIP_FRAMES);
+        
+        let Trampolines { dxgi_swap_chain_present, .. } =
+            TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
+        return dxgi_swap_chain_present(swap_chain, sync_interval, flags);
     }
     
     {
@@ -244,10 +254,22 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
         matches!(&*ctx, InitializationContext::Complete(_, _) | InitializationContext::Done)
     };
     
+    // Wrap render in catch_unwind to prevent crashes
     if is_ready {
-        if let Err(e) = render(&swap_chain) {
-            util::print_dxgi_debug_messages();
-            error!("Render error: {e:?}");
+        let render_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            render(&swap_chain)
+        }));
+        
+        match render_result {
+            Ok(Ok(())) => {}, // Success
+            Ok(Err(e)) => {
+                error!("Render error: {e:?}");
+                util::print_dxgi_debug_messages();
+            },
+            Err(_) => {
+                error!("Render panicked! Disabling rendering for 60 frames");
+                SKIP_FRAMES = 60; // Skip rendering after panic
+            }
         }
     }
 
