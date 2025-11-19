@@ -61,6 +61,7 @@ static mut TRAMPOLINES: OnceLock<Trampolines> = OnceLock::new();
 
 // State per render thread using thread_local (stable pattern)
 struct RenderState {
+    swap_chain_ptr: *const c_void,  // Track swap chain pointer for validation
     swap_chain: Option<IDXGISwapChain3>,
     command_queue: Option<ID3D12CommandQueue>,
     pipeline: Option<Pipeline<D3D12RenderEngine>>,
@@ -70,6 +71,7 @@ struct RenderState {
 impl RenderState {
     fn new() -> Self {
         Self {
+            swap_chain_ptr: std::ptr::null(),
             swap_chain: None,
             command_queue: None,
             pipeline: None,
@@ -78,14 +80,28 @@ impl RenderState {
     }
     
     fn reset(&mut self) {
+        debug!("RenderState::reset called");
         if let Some(mut pipeline) = self.pipeline.take() {
-            debug!("Cleaning up pipeline in reset");
-            pipeline.cleanup();
+            debug!("Cleaning up pipeline");
+            // Catch any panics during cleanup
+            let cleanup_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pipeline.cleanup();
+            }));
+            if cleanup_result.is_err() {
+                error!("Pipeline cleanup panicked!");
+            }
             drop(pipeline);
         }
+        self.swap_chain_ptr = std::ptr::null();
         self.swap_chain = None;
         self.command_queue = None;
         self.initialized = false;
+        debug!("RenderState reset complete");
+    }
+    
+    // Validate that swap chain hasn't changed
+    fn validate_swap_chain(&self, current_ptr: *const c_void) -> bool {
+        self.swap_chain_ptr == current_ptr || self.swap_chain_ptr.is_null()
     }
 }
 
@@ -94,6 +110,7 @@ thread_local! {
 }
 
 static mut RENDER_LOOP: OnceLock<Box<dyn ImguiRenderLoop + Send + Sync>> = OnceLock::new();
+static RENDERING_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 unsafe fn init_pipeline(
     swap_chain: &IDXGISwapChain3,
@@ -117,9 +134,15 @@ unsafe fn init_pipeline(
     Ok(pipeline)
 }
 
-fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
+fn render(swap_chain: &IDXGISwapChain3, swap_chain_ptr: *const c_void) -> Result<()> {
     RENDER_STATE.with(|state_cell| {
         let mut state = state_cell.borrow_mut();
+        
+        // Validate swap chain hasn't changed
+        if !state.validate_swap_chain(swap_chain_ptr) {
+            error!("Swap chain validation failed - aborting render");
+            return Ok(()); // Don't error, just skip this frame
+        }
         
         // Initialize pipeline if needed
         if !state.initialized {
@@ -175,6 +198,7 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
         error!("Swap chain changed: {:p} -> {:p}", LAST_SWAP_CHAIN_PTR, current_ptr);
         
         SKIP_FRAMES = 10;
+        RENDERING_ACTIVE.store(false, Ordering::Release);
         
         // Reset state on swap chain change
         RENDER_STATE.with(|state_cell| {
@@ -201,6 +225,7 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
         if let Ok(mut state) = state_cell.try_borrow_mut() {
             if state.swap_chain.is_none() {
                 state.swap_chain = Some(swap_chain.clone());
+                state.swap_chain_ptr = current_ptr;
             }
         }
     });
@@ -211,16 +236,17 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
     // Check if we can render (have both swap chain and command queue)
     let can_render = RENDER_STATE.with(|state_cell| {
         if let Ok(state) = state_cell.try_borrow() {
-            state.initialized || (state.swap_chain.is_some() && state.command_queue.is_some())
+            state.validate_swap_chain(current_ptr) && 
+            (state.initialized || (state.swap_chain.is_some() && state.command_queue.is_some()))
         } else {
             false
         }
     });
     
     // Try to render if ready
-    if can_render {
+    if can_render && RENDERING_ACTIVE.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
         let render_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            render(&swap_chain)
+            render(&swap_chain, current_ptr)
         }));
         
         match render_result {
@@ -234,6 +260,8 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
                 SKIP_FRAMES = 60;
             }
         }
+        
+        RENDERING_ACTIVE.store(false, Ordering::Release);
     }
 
     trace!("Call IDXGISwapChain::Present trampoline");
@@ -262,6 +290,7 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
     );
     
     debug!("ResizeBuffers - resetting state");
+    RENDERING_ACTIVE.store(false, Ordering::Release);
     
     // Reset render state 
     RENDER_STATE.with(|state_cell| {
@@ -484,5 +513,6 @@ impl Hooks for ImguiDx12Hooks {
         });
         
         RENDER_LOOP.take();
+        RENDERING_ACTIVE.store(false, Ordering::Release);
     }
 }
