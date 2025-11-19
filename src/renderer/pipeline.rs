@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::mem;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,28 +16,26 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_RBUTTONDOWN, WM_RBUTTONUP,
 };
 
-use crate::renderer::input::{imgui_wnd_proc_impl, WndProcType};
+use crate::renderer::input::WndProcType;
 use crate::renderer::RenderEngine;
 use crate::{util, ImguiRenderLoop, MessageFilter};
 
 type RenderLoop = Box<dyn ImguiRenderLoop + Send + Sync>;
 
-// Store only the window procedure and original wnd proc
+// Shared state accessible from window procedure
 static PIPELINE_STATES: Lazy<Mutex<HashMap<isize, Arc<PipelineSharedState>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-// Separate storage for mutable pipeline access
-static PIPELINES: Lazy<Mutex<HashMap<isize, *mut PipelineData>>> =
+// Store Context pointers (unsafe but controlled)
+struct ContextPtr(*mut Context);
+unsafe impl Send for ContextPtr {}
+unsafe impl Sync for ContextPtr {}
+
+static PIPELINE_CONTEXTS: Lazy<Mutex<HashMap<isize, ContextPtr>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 pub(crate) struct PipelineSharedState {
     pub(crate) wnd_proc: WndProcType,
-}
-
-// Internal mutable data stored separately
-struct PipelineData {
-    ctx: Context,
-    message_filter: MessageFilter,
 }
 
 pub(crate) struct Pipeline<T: RenderEngine> {
@@ -95,22 +92,9 @@ impl<T: RenderEngine> Pipeline<T> {
     }
 
     pub(crate) fn prepare_render(&mut self) -> Result<()> {
-        // Store pointer to our context for WndProc to access
-        let data = Box::new(PipelineData {
-            ctx: unsafe { std::ptr::read(&self.ctx) }, // Unsafe: temporarily move out
-            message_filter: MessageFilter::empty(),
-        });
-        
-        let data_ptr = Box::into_raw(data);
-        PIPELINES.lock().insert(self.hwnd.0, data_ptr);
-
-        // Get message filter from render loop
-        let message_filter = self.render_loop.message_filter(self.ctx.io());
-        
-        // Update the stored message filter
-        unsafe {
-            (*data_ptr).message_filter = message_filter;
-        }
+        // Store pointer to context for WndProc access
+        let ctx_ptr = &mut self.ctx as *mut Context;
+        PIPELINE_CONTEXTS.lock().insert(self.hwnd.0, ContextPtr(ctx_ptr));
 
         let io = self.ctx.io_mut();
         io.nav_active = true;
@@ -144,15 +128,8 @@ impl<T: RenderEngine> Pipeline<T> {
 
         self.engine.render(draw_data, render_target)?;
         
-        // Clean up the pipeline data pointer after render
-        if let Some(data_ptr) = PIPELINES.lock().remove(&self.hwnd.0) {
-            unsafe {
-                // Move context back
-                std::ptr::write(&mut self.ctx, (*data_ptr).ctx);
-                // Free the box
-                let _ = Box::from_raw(data_ptr);
-            }
-        }
+        // Remove context pointer after render
+        PIPELINE_CONTEXTS.lock().remove(&self.hwnd.0);
 
         Ok(())
     }
@@ -170,13 +147,8 @@ impl<T: RenderEngine> Pipeline<T> {
     }
 
     pub(crate) fn cleanup(&mut self) {
-        // Remove from both maps
         PIPELINE_STATES.lock().remove(&self.hwnd.0);
-        if let Some(data_ptr) = PIPELINES.lock().remove(&self.hwnd.0) {
-            unsafe {
-                let _ = Box::from_raw(data_ptr);
-            }
-        }
+        PIPELINE_CONTEXTS.lock().remove(&self.hwnd.0);
         
         unsafe {
             SetWindowLongPtrW(self.hwnd, GWLP_WNDPROC, self.shared_state.wnd_proc as usize as _)
@@ -189,7 +161,7 @@ impl<T: RenderEngine> Pipeline<T> {
     }
 }
 
-// Process messages synchronously 
+// Process messages synchronously
 unsafe extern "system" fn pipeline_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -199,84 +171,64 @@ unsafe extern "system" fn pipeline_wnd_proc(
     // Get shared state for original wnd proc
     let shared_state = {
         let Some(shared_state_guard) = PIPELINE_STATES.try_lock() else {
-            error!("Could not lock shared state in window procedure");
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         };
 
         let Some(shared_state) = shared_state_guard.get(&hwnd.0) else {
-            // No pipeline for this window, just call default
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         };
 
         Arc::clone(shared_state)
     };
 
-    // Try to get mutable pipeline data
-    let pipeline_data_ptr = {
-        PIPELINES.lock().get(&hwnd.0).copied()
-    };
+    // Try to get context pointer
+    let ctx_ptr = PIPELINE_CONTEXTS.lock().get(&hwnd.0).map(|p| p.0);
 
-    // If we have pipeline data, process message synchronously
-    if let Some(data_ptr) = pipeline_data_ptr {
-        // Process message with ImGui immediately
-        let ctx = &mut (*data_ptr).ctx;
+    // If we have context, process message synchronously
+    if let Some(ctx_ptr) = ctx_ptr {
+        let ctx = &mut *ctx_ptr;
         
         // Update ImGui with this message
-        match msg {
+        process_imgui_message(ctx, msg, wparam, lparam);
+        
+        // Make decision with CURRENT state
+        let io = ctx.io();
+        let should_block = match msg {
             WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP |
             WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MOUSEWHEEL | WM_MOUSEMOVE => {
-                // Process mouse message
-                imgui_wnd_proc_impl(hwnd, msg, wparam, lparam, ctx);
-                
-                // Make decision with CURRENT state
-                let io = ctx.io();
-                if io.want_capture_mouse {
-                    // ImGui wants this mouse message - block it
-                    return LRESULT(1);
-                }
+                io.want_capture_mouse
             }
             WM_KEYDOWN | WM_KEYUP | WM_CHAR => {
-                // Process keyboard message
-                imgui_wnd_proc_impl(hwnd, msg, wparam, lparam, ctx);
-                
-                // Make decision with CURRENT state
-                let io = ctx.io();
-                if io.want_capture_keyboard {
-                    // ImGui wants this keyboard message - block it
-                    return LRESULT(1);
-                }
+                io.want_capture_keyboard
             }
-            _ => {
-                // Non-input message, just process it
-                imgui_wnd_proc_impl(hwnd, msg, wparam, lparam, ctx);
-            }
+            _ => false,
+        };
+        
+        if should_block {
+            return LRESULT(1);
         }
     } else {
-        // No pipeline data available (between frames or not initialized yet)
-        // Take conservative approach: block all input to prevent issues
+        // Conservative: block input when context not available
         match msg {
             WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP |
             WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MOUSEWHEEL | WM_MOUSEMOVE |
             WM_KEYDOWN | WM_KEYUP | WM_CHAR => {
-                // Block input when we can't check ImGui state
-                // Better to miss game input than break the overlay
                 return LRESULT(1);
             }
             _ => {}
         }
     }
 
-    // Message not blocked - forward to original window procedure
+    // Forward to original window procedure
     CallWindowProcW(Some(shared_state.wnd_proc), hwnd, msg, wparam, lparam)
 }
 
-// Simplified version of imgui_wnd_proc_impl that works with just Context
-unsafe fn imgui_wnd_proc_impl(
-    hwnd: HWND,
+// Process Windows message and update ImGui
+unsafe fn process_imgui_message(
+    ctx: &mut Context,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
-    ctx: &mut Context,
 ) {
     let io = ctx.io_mut();
     
@@ -308,31 +260,30 @@ unsafe fn imgui_wnd_proc_impl(
             let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32;
             io.add_mouse_pos_event([x, y]);
         }
-        WM_KEYDOWN => {
+        WM_KEYDOWN | WM_KEYUP => {
             let vk = wparam.0 as i32;
+            let is_down = msg == WM_KEYDOWN;
             if vk < 256 {
-                io.add_key_event(vk_to_imgui_key(vk), true);
-            }
-        }
-        WM_KEYUP => {
-            let vk = wparam.0 as i32;
-            if vk < 256 {
-                io.add_key_event(vk_to_imgui_key(vk), false);
+                if let Some(key) = vk_to_imgui_key(vk) {
+                    io.add_key_event(key, is_down);
+                }
             }
         }
         WM_CHAR => {
             if wparam.0 > 0 && wparam.0 < 0x10000 {
-                io.add_input_character(wparam.0 as u16 as char);
+                if let Some(c) = char::from_u32(wparam.0 as u32) {
+                    io.add_input_character(c);
+                }
             }
         }
         _ => {}
     }
 }
 
-// Helper to convert VK codes to ImGui keys
-fn vk_to_imgui_key(vk: i32) -> imgui::Key {
+// Convert VK codes to ImGui keys
+fn vk_to_imgui_key(vk: i32) -> Option<imgui::Key> {
     use imgui::Key;
-    match vk {
+    Some(match vk {
         0x09 => Key::Tab,
         0x25 => Key::LeftArrow,
         0x26 => Key::UpArrow,
@@ -348,23 +299,62 @@ fn vk_to_imgui_key(vk: i32) -> imgui::Key {
         0x20 => Key::Space,
         0x0D => Key::Enter,
         0x1B => Key::Escape,
-        0x11 => Key::LeftCtrl,
-        0xA2 => Key::LeftCtrl,
+        0x11 | 0xA2 => Key::LeftCtrl,
         0xA3 => Key::RightCtrl,
-        0x10 => Key::LeftShift,
-        0xA0 => Key::LeftShift,
+        0x10 | 0xA0 => Key::LeftShift,
         0xA1 => Key::RightShift,
-        0x12 => Key::LeftAlt,
-        0xA4 => Key::LeftAlt,
+        0x12 | 0xA4 => Key::LeftAlt,
         0xA5 => Key::RightAlt,
         0x5B => Key::LeftSuper,
         0x5C => Key::RightSuper,
+        0x30 => Key::Alpha0,
+        0x31 => Key::Alpha1,
+        0x32 => Key::Alpha2,
+        0x33 => Key::Alpha3,
+        0x34 => Key::Alpha4,
+        0x35 => Key::Alpha5,
+        0x36 => Key::Alpha6,
+        0x37 => Key::Alpha7,
+        0x38 => Key::Alpha8,
+        0x39 => Key::Alpha9,
         0x41 => Key::A,
+        0x42 => Key::B,
         0x43 => Key::C,
+        0x44 => Key::D,
+        0x45 => Key::E,
+        0x46 => Key::F,
+        0x47 => Key::G,
+        0x48 => Key::H,
+        0x49 => Key::I,
+        0x4A => Key::J,
+        0x4B => Key::K,
+        0x4C => Key::L,
+        0x4D => Key::M,
+        0x4E => Key::N,
+        0x4F => Key::O,
+        0x50 => Key::P,
+        0x51 => Key::Q,
+        0x52 => Key::R,
+        0x53 => Key::S,
+        0x54 => Key::T,
+        0x55 => Key::U,
         0x56 => Key::V,
+        0x57 => Key::W,
         0x58 => Key::X,
         0x59 => Key::Y,
         0x5A => Key::Z,
-        _ => Key::None,
-    }
+        0x70 => Key::F1,
+        0x71 => Key::F2,
+        0x72 => Key::F3,
+        0x73 => Key::F4,
+        0x74 => Key::F5,
+        0x75 => Key::F6,
+        0x76 => Key::F7,
+        0x77 => Key::F8,
+        0x78 => Key::F9,
+        0x79 => Key::F10,
+        0x7A => Key::F11,
+        0x7B => Key::F12,
+        _ => return None,
+    })
 }
