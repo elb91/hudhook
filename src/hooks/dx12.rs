@@ -211,7 +211,6 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
 ) -> HRESULT {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    // Insert swap chain
     {
         INITIALIZATION_CONTEXT.lock().insert_swap_chain(&swap_chain);
     }
@@ -219,37 +218,16 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
     let Trampolines { dxgi_swap_chain_present, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
 
-    // Check initialization status with detailed logging
-    let init_status = {
+    // Check if initialization is complete
+    let is_ready = {
         let ctx = INITIALIZATION_CONTEXT.lock();
-        match &*ctx {
-            InitializationContext::Empty => "Empty",
-            InitializationContext::WithSwapChain(_) => "WithSwapChain",
-            InitializationContext::Complete(_, _) => "Complete",
-            InitializationContext::Done => "Done",
-        }
+        matches!(&*ctx, InitializationContext::Complete(_, _) | InitializationContext::Done)
     };
     
-    // Log every 60 frames
-    static mut FRAME_COUNT: u32 = 0;
-    FRAME_COUNT += 1;
-    if FRAME_COUNT % 60 == 0 {
-        debug!("Present frame {}: init_status={}", FRAME_COUNT, init_status);
-    }
-    
-    // Try to render if complete or done
-    let should_render = matches!(init_status, "Complete" | "Done");
-    
-    if should_render {
+    if is_ready {
         if let Err(e) = render(&swap_chain) {
-            if FRAME_COUNT % 60 == 0 {
-                error!("Render error at frame {}: {e:?}", FRAME_COUNT);
-            }
             util::print_dxgi_debug_messages();
-        }
-    } else {
-        if FRAME_COUNT % 60 == 0 {
-            trace!("Skipping render - init_status={}", init_status);
+            error!("Render error: {e:?}");
         }
     }
 
@@ -274,31 +252,33 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
 ) -> HRESULT {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    debug!(
-        "ResizeBuffers called - resetting pipeline (scene transition or window resize)"
+    error!(
+        "!!! ResizeBuffers called !!! buffer_count={}, width={}, height={}, format={:?}",
+        buffer_count, width, height, new_format
     );
     
+    debug!("ResizeBuffers - resetting pipeline");
+    
     // Reset everything
-    // This handles scene transitions (game -> menu -> game)
     if let Some(pipeline) = PIPELINE.take() {
         debug!("Dropping existing pipeline");
         drop(pipeline);
     }
     
-    // Reset initialization context to allow reinitialization
     {
         let mut ctx = INITIALIZATION_CONTEXT.lock();
         ctx.reset();
+        debug!("Initialization context reset");
     }
-    
-    // Note: Pipeline will be recreated on next Present call
-    // The render loop is already stored in RENDER_LOOP static
     
     let Trampolines { dxgi_swap_chain_resize_buffers, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
 
-    trace!("Call IDXGISwapChain::ResizeBuffers trampoline");
-    dxgi_swap_chain_resize_buffers(p_this, buffer_count, width, height, new_format, flags)
+    debug!("Calling original ResizeBuffers");
+    let result = dxgi_swap_chain_resize_buffers(p_this, buffer_count, width, height, new_format, flags);
+    debug!("ResizeBuffers returned: {:?}", result);
+    
+    result
 }
 
 unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
