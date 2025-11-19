@@ -191,11 +191,11 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
         SKIP_FRAMES = 10; // Skip next 10 frames
         
         if let Some(pipeline_mutex) = PIPELINE.take() {
-            if let Some(mut pipeline) = pipeline_mutex.into_inner().take() {
-                debug!("Cleaning up pipeline on swap chain change");
-                pipeline.cleanup(); // Restores window proc!
-                drop(pipeline);     // GPU fence wait happens in Drop
-            }
+            // Extract Pipeline from Mutex
+            let mut pipeline = pipeline_mutex.into_inner();
+            debug!("Cleaning up pipeline on swap chain change");
+            pipeline.cleanup(); // Restores window proc!
+            drop(pipeline);     // GPU fence wait happens in Drop
         }
         
         INITIALIZATION_CONTEXT.lock().reset();
@@ -270,14 +270,13 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
     
     debug!("ResizeBuffers - starting proper cleanup");
     
-    // Proper cleanup with window proc restoration
     if let Some(pipeline_mutex) = PIPELINE.take() {
-        if let Some(mut pipeline) = pipeline_mutex.into_inner().take() {
-            debug!("Restoring window proc before pipeline drop");
-            pipeline.cleanup(); // must restore window proc before drop!
-            debug!("Dropping pipeline (GPU fence wait will occur)");
-            drop(pipeline);     // Drop impl waits for GPU fence
-        }
+        // Extract Pipeline from Mutex
+        let mut pipeline = pipeline_mutex.into_inner();
+        debug!("Restoring window proc before pipeline drop");
+        pipeline.cleanup(); // must restore window proc before drop!
+        debug!("Dropping pipeline (GPU fence wait will occur)");
+        drop(pipeline);     // Drop impl waits for GPU fence
     }
     
     {
@@ -485,10 +484,9 @@ impl Hooks for ImguiDx12Hooks {
         
         // Proper cleanup on unhook
         if let Some(pipeline_mutex) = PIPELINE.take() {
-            if let Some(mut pipeline) = pipeline_mutex.into_inner().take() {
-                pipeline.cleanup();
-                drop(pipeline);
-            }
+            let mut pipeline = pipeline_mutex.into_inner();
+            pipeline.cleanup();
+            drop(pipeline);
         }
         
         RENDER_LOOP.take();
