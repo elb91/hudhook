@@ -1,7 +1,7 @@
 //! Hooks for DirectX 12.
 //! 
 //! Based on proven stable D3D12Hook.cpp implementation
-//! Using thread_local + RefCell 
+//! Using thread_local + RefCell
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -94,7 +94,6 @@ thread_local! {
 }
 
 static mut RENDER_LOOP: OnceLock<Box<dyn ImguiRenderLoop + Send + Sync>> = OnceLock::new();
-static PIPELINE_READY: AtomicBool = AtomicBool::new(false);
 
 unsafe fn init_pipeline(
     swap_chain: &IDXGISwapChain3,
@@ -125,11 +124,11 @@ fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
         // Initialize pipeline if needed
         if !state.initialized {
             if let (Some(sc), Some(cq)) = (&state.swap_chain, &state.command_queue) {
+                debug!("Initializing pipeline...");
                 match unsafe { init_pipeline(sc, cq) } {
                     Ok(pipeline) => {
                         state.pipeline = Some(pipeline);
                         state.initialized = true;
-                        PIPELINE_READY.store(true, Ordering::Release);
                         debug!("Pipeline initialized successfully");
                     }
                     Err(e) => {
@@ -138,7 +137,8 @@ fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
                     }
                 }
             } else {
-                return Err(Error::from_hresult(HRESULT(-1)));
+                // Not ready yet
+                return Ok(());
             }
         }
         
@@ -164,7 +164,7 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
 ) -> HRESULT {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    //  Single SKIP_FRAMES 
+    // Single SKIP_FRAMES (not shadowed)
     static mut SKIP_FRAMES: u32 = 0;
     static mut LAST_SWAP_CHAIN_PTR: *const c_void = std::ptr::null();
     
@@ -183,7 +183,6 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
             }
         });
         
-        PIPELINE_READY.store(false, Ordering::Release);
         LAST_SWAP_CHAIN_PTR = current_ptr;
     }
     
@@ -209,8 +208,17 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
     let Trampolines { dxgi_swap_chain_present, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
 
+    // Check if we can render (have both swap chain and command queue)
+    let can_render = RENDER_STATE.with(|state_cell| {
+        if let Ok(state) = state_cell.try_borrow() {
+            state.initialized || (state.swap_chain.is_some() && state.command_queue.is_some())
+        } else {
+            false
+        }
+    });
+    
     // Try to render if ready
-    if PIPELINE_READY.load(Ordering::Acquire) {
+    if can_render {
         let render_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             render(&swap_chain)
         }));
@@ -224,7 +232,6 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
             Err(_) => {
                 error!("Render panicked! Disabling rendering for 60 frames");
                 SKIP_FRAMES = 60;
-                PIPELINE_READY.store(false, Ordering::Release);
             }
         }
     }
@@ -262,8 +269,6 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
             state.reset();
         }
     });
-    
-    PIPELINE_READY.store(false, Ordering::Release);
     
     let Trampolines { dxgi_swap_chain_resize_buffers, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
@@ -479,6 +484,5 @@ impl Hooks for ImguiDx12Hooks {
         });
         
         RENDER_LOOP.take();
-        PIPELINE_READY.store(false, Ordering::Release);
     }
 }
