@@ -481,8 +481,8 @@ fn get_target_addrs() -> (
         debug!("  ResizeBuffers:        {:p}", resize_buffers_ptr as *const c_void);
         debug!("  ExecuteCommandLists:  {:p}", execute_command_lists_ptr as *const c_void);
         
-        let windows_present = swap_chain.vtable().Present as *const c_void;
-        let windows_resize = swap_chain.vtable().ResizeBuffers as *const c_void;
+        let windows_present = swap_chain.vtable().base__.base__.base__.Present as *const c_void;
+        let windows_resize = swap_chain.vtable().base__.base__.base__.ResizeBuffers as *const c_void;
         let windows_execute = command_queue.vtable().ExecuteCommandLists as *const c_void;
         
         if present_ptr as *const c_void != windows_present {
