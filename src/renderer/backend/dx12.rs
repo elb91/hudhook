@@ -6,7 +6,7 @@ use std::{mem, ptr, slice};
 
 use imgui::internal::RawWrapper;
 use imgui::{BackendFlags, Context, DrawCmd, DrawData, DrawIdx, DrawVert, TextureId};
-use tracing::{error, debug};
+use tracing::error;
 use windows::core::{s, w, Error, Interface, Result, HRESULT};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::Fxc::*;
@@ -45,7 +45,7 @@ impl D3D12RenderEngine {
         let (device, command_queue, command_allocator, command_list) =
             unsafe { create_command_objects(command_queue) }?;
 
-        let (rtv_heap, texture_heap) = unsafe { create_heaps(&device, &command_queue) }?;
+        let (rtv_heap, texture_heap) = unsafe { create_heaps(&device) }?;
         let rtv_heap_start = unsafe { rtv_heap.GetCPUDescriptorHandleForHeapStart() };
 
         let (root_signature, pipeline_state) = unsafe { create_shader_program(&device) }?;
@@ -102,15 +102,11 @@ impl RenderEngine for D3D12RenderEngine {
 
     fn render(&mut self, draw_data: &DrawData, render_target: Self::RenderTarget) -> Result<()> {
         unsafe {
-            // just execute commands without blocking wait
-            // The GPU will serialize operations on the same queue automatically
-            
             self.device.CreateRenderTargetView(&render_target, None, self.rtv_heap_start);
 
             self.command_allocator.Reset()?;
             self.command_list.Reset(&self.command_allocator, None)?;
 
-            // Use PRESENT as initial state like C++ version
             let present_to_rtv_barriers = [util::create_barrier(
                 &render_target,
                 D3D12_RESOURCE_STATE_PRESENT,
@@ -120,7 +116,7 @@ impl RenderEngine for D3D12RenderEngine {
             let rtv_to_present_barriers = [util::create_barrier(
                 &render_target,
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
-                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COMMON,
             )];
 
             self.command_list.ResourceBarrier(&present_to_rtv_barriers);
@@ -131,12 +127,9 @@ impl RenderEngine for D3D12RenderEngine {
 
             self.command_list.ResourceBarrier(&rtv_to_present_barriers);
             self.command_list.Close()?;
-            
-            // Execute commands
             self.command_queue.ExecuteCommandLists(&[Some(self.command_list.cast()?)]);
-            
-            // Only signal fence for tracking, don't wait
             self.command_queue.Signal(self.fence.fence(), self.fence.value())?;
+            self.fence.wait()?;
             self.fence.incr();
 
             present_to_rtv_barriers.into_iter().for_each(util::drop_barrier);
@@ -170,7 +163,6 @@ impl D3D12RenderEngine {
                 self.index_buffer.extend(indices);
             });
 
-        // Upload without fence parameter - handle reallocation differently
         self.vertex_buffer.upload(&self.device)?;
         self.index_buffer.upload(&self.device)?;
 
@@ -223,6 +215,9 @@ impl D3D12RenderEngine {
                         }
                     },
                     DrawCmd::ResetRenderState => {
+                        // Q: looking at the commands recorded in here, it
+                        // doesn't seem like this should have any effect
+                        // whatsoever. What am I doing wrong?
                         self.setup_render_state(draw_data);
                     },
                     DrawCmd::RawCallback { callback, raw_cmd } => callback(cl.raw(), raw_cmd),
@@ -295,10 +290,7 @@ unsafe fn create_command_objects(
     Ok((device, command_queue, command_allocator, command_list))
 }
 
-unsafe fn create_heaps(
-    device: &ID3D12Device,
-    command_queue: &ID3D12CommandQueue,
-) -> Result<(ID3D12DescriptorHeap, TextureHeap)> {
+unsafe fn create_heaps(device: &ID3D12Device) -> Result<(ID3D12DescriptorHeap, TextureHeap)> {
     let rtv_heap: ID3D12DescriptorHeap =
         device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -315,8 +307,7 @@ unsafe fn create_heaps(
             NodeMask: 0,
         })?;
 
-    // Pass command_queue instead of creating a new one
-    let texture_heap = TextureHeap::new(device, srv_heap, command_queue)?;
+    let texture_heap = TextureHeap::new(device, srv_heap)?;
 
     Ok((rtv_heap, texture_heap))
 }
@@ -634,7 +625,6 @@ impl<T> Buffer<T> {
     fn upload(&mut self, device: &ID3D12Device) -> Result<()> {
         let capacity = self.data.capacity();
         if capacity > self.resource_capacity {
-            // Just reallocate - GPU serialization on same queue handles safety
             drop(mem::replace(&mut self.resource, Self::create_resource(device, capacity)?));
             self.resource_capacity = capacity;
         }
@@ -664,7 +654,6 @@ struct TextureHeap {
     srv_heap: ID3D12DescriptorHeap,
     srv_staging_heap: ID3D12DescriptorHeap,
     textures: Vec<Texture>,
-    // Use shared command queue
     command_queue: ID3D12CommandQueue,
     command_allocator: ID3D12CommandAllocator,
     command_list: ID3D12GraphicsCommandList,
@@ -672,13 +661,15 @@ struct TextureHeap {
 }
 
 impl TextureHeap {
-    fn new(
-        device: &ID3D12Device,
-        srv_heap: ID3D12DescriptorHeap,
-        command_queue: &ID3D12CommandQueue,
-    ) -> Result<Self> {
-        // Use passed queue instead of creating new one
-        let command_queue = command_queue.clone();
+    fn new(device: &ID3D12Device, srv_heap: ID3D12DescriptorHeap) -> Result<Self> {
+        let command_queue = unsafe {
+            device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                Priority: 0,
+                Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
+                NodeMask: 0,
+            })
+        }?;
 
         let command_allocator: ID3D12CommandAllocator =
             unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }?;
@@ -689,8 +680,8 @@ impl TextureHeap {
 
         unsafe {
             command_list.Close()?;
-            command_allocator.SetName(w!("hudhook Texture Upload Command Allocator"))?;
-            command_list.SetName(w!("hudhook Texture Upload Command List"))?;
+            command_allocator.SetName(w!("hudhook Render Engine Command Allocator"))?;
+            command_list.SetName(w!("hudhook Render Engine Command List"))?;
         }
 
         let srv_staging_heap: ID3D12DescriptorHeap = unsafe {
@@ -743,7 +734,7 @@ impl TextureHeap {
             self.srv_heap = srv_heap;
             self.srv_staging_heap = srv_staging_heap;
 
-            // Adjust texture GPU pointers
+            // Adjust texture GPU pointers.
             let gpu_heap_start = self.srv_heap.GetGPUDescriptorHandleForHeapStart();
             let heap_inc_size = self
                 .device
@@ -859,7 +850,7 @@ impl TextureHeap {
 
         let upload_row_size = width * 4;
         let align = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-        let upload_pitch = upload_row_size.div_ceil(align) * align;
+        let upload_pitch = upload_row_size.div_ceil(align) * align; // 256 bytes aligned
         let upload_size = height * upload_pitch;
 
         let upload_buffer: ID3D12Resource = util::try_out_ptr(|v| unsafe {
@@ -938,18 +929,18 @@ impl TextureHeap {
 
         self.command_list.ResourceBarrier(&barriers);
         self.command_list.Close()?;
-        
-        // Execute on shared queue 
         self.command_queue.ExecuteCommandLists(&[Some(self.command_list.cast()?)]);
-        
-        // Signal fence for tracking but don't wait
         self.command_queue.Signal(self.fence.fence(), self.fence.value())?;
+        self.fence.wait()?;
         self.fence.incr();
 
         barriers.into_iter().for_each(util::drop_barrier);
 
-        // Now safe to clean up ManuallyDrop
-        let _ = ManuallyDrop::into_inner(src_location.pResource);
+        // Apparently, leaking the upload buffer into the location is necessary.
+        // Uncommenting the following line consistently leads to a crash, which
+        // points to a double-free, but I don't know why: upload_buffer should
+        // stay alive with a positive refcount until the end of this block.
+        // let _ = ManuallyDrop::into_inner(src_location.pResource);
         let _ = ManuallyDrop::into_inner(dst_location.pResource);
 
         Ok(())
