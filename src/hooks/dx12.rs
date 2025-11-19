@@ -1,5 +1,11 @@
-// hudhook/src/hooks/dx12.rs
 //! Hooks for DirectX 12.
+//! 
+//! based on proven stable D3D12Hook.cpp implementation
+//! Changes:
+//! 1. Check queue type is DIRECT in ExecuteCommandLists
+//! 2. Reset pipeline on ResizeBuffers (handles scene transitions)
+//! 3. Proper initialization context reset
+//! 4. Manual vtable offset verification
 
 use std::ffi::c_void;
 use std::mem;
@@ -66,6 +72,7 @@ enum InitializationContext {
 }
 
 impl InitializationContext {
+    // Transition to a state where the swap chain is set. Ignore other mutations.
     fn insert_swap_chain(&mut self, swap_chain: &IDXGISwapChain3) {
         *self = match mem::replace(self, InitializationContext::Empty) {
             InitializationContext::Empty => {
@@ -75,22 +82,28 @@ impl InitializationContext {
         }
     }
 
-    // MODIFIED: Check if this is the real swapchain queue
+    // Check that command queue is DIRECT type before accepting it
     fn insert_command_queue(&mut self, command_queue: &ID3D12CommandQueue) {
         *self = match mem::replace(self, InitializationContext::Empty) {
             InitializationContext::WithSwapChain(swap_chain) => {
-                let queue_ptr = command_queue.as_raw() as usize;
+                // Only accept DIRECT command queues 
+                let desc = unsafe { command_queue.GetDesc() };
                 
-                // Check if this is the swapchain queue (CommandQueue #3)
-                if unsafe { Self::is_swapchain_queue(queue_ptr) } {
+                if desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT {
+                    debug!(
+                        "Ignoring command queue {:?} with type {:?} (not DIRECT)",
+                        command_queue, desc.Type
+                    );
+                    return InitializationContext::WithSwapChain(swap_chain);
+                }
+                
+                if unsafe { Self::check_command_queue(&swap_chain, command_queue) } {
                     trace!(
-                        "Found swapchain CommandQueue at 0x{:x} for swap chain {:?}",
-                        queue_ptr,
-                        swap_chain
+                        "Found DIRECT command queue matching swap chain {swap_chain:?} at \
+                         {command_queue:?}"
                     );
                     InitializationContext::Complete(swap_chain, command_queue.clone())
                 } else {
-                    // Not the right queue, keep waiting
                     InitializationContext::WithSwapChain(swap_chain)
                 }
             },
@@ -98,6 +111,7 @@ impl InitializationContext {
         }
     }
 
+    // Retrieve the values if the context is complete.
     fn get(&self) -> Option<(IDXGISwapChain3, ID3D12CommandQueue)> {
         if let InitializationContext::Complete(swap_chain, command_queue) = self {
             Some((swap_chain.clone(), command_queue.clone()))
@@ -106,19 +120,42 @@ impl InitializationContext {
         }
     }
 
+    // Mark the context as done so no further operations are executed on it.
     fn done(&mut self) {
         if let InitializationContext::Complete(..) = self {
             *self = InitializationContext::Done;
         }
     }
+    
+    // Add reset method 
+    fn reset(&mut self) {
+        *self = InitializationContext::Empty;
+    }
 
-    // NEW: Call into d3d12_hook to check if this is the swapchain queue
-    unsafe fn is_swapchain_queue(queue_ptr: usize) -> bool {
-        // This will be resolved at link time to your d3d12_hook module
-        extern "Rust" {
-            fn is_swapchain_queue(queue_ptr: usize) -> bool;
+    unsafe fn check_command_queue(
+        swap_chain: &IDXGISwapChain3,
+        command_queue: &ID3D12CommandQueue,
+    ) -> bool {
+        let swap_chain_ptr = swap_chain.as_raw() as *mut *mut c_void;
+        let readable_ptrs = util::readable_region(swap_chain_ptr, 512);
+
+        match readable_ptrs.iter().position(|&ptr| std::ptr::eq(ptr, command_queue.as_raw())) {
+            Some(idx) => {
+                debug!(
+                    "Found command queue pointer in swap chain struct at offset +0x{:x}",
+                    idx * mem::size_of::<usize>(),
+                );
+                true
+            },
+            None => {
+                warn!(
+                    "Couldn't find command queue pointer in swap chain struct ({} out of 512 \
+                     pointers were readable)",
+                    readable_ptrs.len()
+                );
+                false
+            },
         }
-        is_swapchain_queue(queue_ptr)
     }
 }
 
@@ -203,6 +240,7 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
     result
 }
 
+// Complete reset on ResizeBuffers (handles scene transitions)
 unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
     p_this: IDXGISwapChain3,
     buffer_count: u32,
@@ -212,6 +250,27 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
     flags: u32,
 ) -> HRESULT {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
+    
+    debug!(
+        "ResizeBuffers called - resetting pipeline (scene transition or window resize)"
+    );
+    
+    // Reset everything
+    // This handles scene transitions (game -> menu -> game)
+    if let Some(pipeline) = PIPELINE.take() {
+        debug!("Dropping existing pipeline");
+        drop(pipeline);
+    }
+    
+    // Reset initialization context to allow reinitialization
+    {
+        let mut ctx = INITIALIZATION_CONTEXT.lock();
+        ctx.reset();
+    }
+    
+    // Note: Pipeline will be recreated on next Present call
+    // The render loop is already stored in RENDER_LOOP static
+    
     let Trampolines { dxgi_swap_chain_resize_buffers, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
 
@@ -231,6 +290,7 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
     );
 
     {
+        // is applied in insert_command_queue - it checks queue type
         INITIALIZATION_CONTEXT.lock().insert_command_queue(&command_queue);
     }
 
@@ -296,14 +356,66 @@ fn get_target_addrs() -> (
         },
     };
 
-    let present_ptr: DXGISwapChainPresentType =
-        unsafe { mem::transmute(swap_chain.vtable().Present) };
-    let resize_buffers_ptr: DXGISwapChainResizeBuffersType =
-        unsafe { mem::transmute(swap_chain.vtable().ResizeBuffers) };
-    let cqecl_ptr: D3D12CommandQueueExecuteCommandListsType =
-        unsafe { mem::transmute(command_queue.vtable().ExecuteCommandLists) };
-
-    (present_ptr, resize_buffers_ptr, cqecl_ptr)
+    // Manual vtable extraction with verified offsets
+    // Based on D3D12Hook.cpp
+    unsafe {
+        // Get raw vtable pointers
+        let sc_vtable = *(swap_chain.as_raw() as *const *const usize);
+        let q_vtable = *(command_queue.as_raw() as *const *const usize);
+        
+        //  Use correct, verified offsets
+        // IDXGISwapChain vtable offsets:
+        //   0-2: IUnknown (QueryInterface, AddRef, Release)
+        //   3-7: IDXGIObject methods
+        //   8: Present         ← Offset 8
+        //   9: GetBuffer
+        //   10-12: Other methods
+        //   13: ResizeBuffers  ← Offset 13
+        //
+        // ID3D12CommandQueue vtable offsets:
+        //   0-2: IUnknown
+        //   3-9: ID3D12Object + ID3D12DeviceChild
+        //   10: ExecuteCommandLists  ← Offset 10
+        
+        let present_ptr = *sc_vtable.add(8);
+        let resize_buffers_ptr = *sc_vtable.add(13);
+        let execute_command_lists_ptr = *q_vtable.add(10);
+        
+        debug!("Vtable addresses extracted:");
+        debug!("  Present:              {:p}", present_ptr as *const c_void);
+        debug!("  ResizeBuffers:        {:p}", resize_buffers_ptr as *const c_void);
+        debug!("  ExecuteCommandLists:  {:p}", execute_command_lists_ptr as *const c_void);
+        
+        // Verify these match what windows-rs would give us
+        let windows_present = swap_chain.vtable().Present as *const c_void;
+        let windows_resize = swap_chain.vtable().ResizeBuffers as *const c_void;
+        let windows_execute = command_queue.vtable().ExecuteCommandLists as *const c_void;
+        
+        if present_ptr as *const c_void != windows_present {
+            warn!(
+                "Present vtable mismatch! Manual: {:p}, Windows-rs: {:p}",
+                present_ptr as *const c_void, windows_present
+            );
+        }
+        if resize_buffers_ptr as *const c_void != windows_resize {
+            warn!(
+                "ResizeBuffers vtable mismatch! Manual: {:p}, Windows-rs: {:p}",
+                resize_buffers_ptr as *const c_void, windows_resize
+            );
+        }
+        if execute_command_lists_ptr as *const c_void != windows_execute {
+            warn!(
+                "ExecuteCommandLists vtable mismatch! Manual: {:p}, Windows-rs: {:p}",
+                execute_command_lists_ptr as *const c_void, windows_execute
+            );
+        }
+        
+        (
+            mem::transmute(present_ptr),
+            mem::transmute(resize_buffers_ptr),
+            mem::transmute(execute_command_lists_ptr),
+        )
+    }
 }
 
 /// Hooks for DirectX 12.
@@ -384,7 +496,7 @@ impl Hooks for ImguiDx12Hooks {
     unsafe fn unhook(&mut self) {
         TRAMPOLINES.take();
         PIPELINE.take().map(|p| p.into_inner().take());
-        RENDER_LOOP.take();
+        RENDER_LOOP.take(); // should already be null
 
         *INITIALIZATION_CONTEXT.lock() = InitializationContext::Empty;
     }
