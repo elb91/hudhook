@@ -1,10 +1,10 @@
 //! Hooks for DirectX 12.
 //! 
-//! Fixed version - Key improvements:
-//! - Command queue selection by num_command_lists (game uses 5+, our test uses 1)
-//! - Safe resource cleanup (command queue persists across swap chain changes)
-//! - No COM object cloning (store raw pointers)
-//! - Proper cleanup order in ResizeBuffers
+//!  Key improvements:
+//! - Command queue selection by num_command_lists (game uses 5+, test uses 1)
+//! - Command queue persists across swap chain changes
+//! - Safe resource cleanup
+//! - No COM object cloning
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -62,7 +62,7 @@ struct Trampolines {
 
 static mut TRAMPOLINES: OnceLock<Trampolines> = OnceLock::new();
 
-// State per render thread using thread_local (stable pattern)
+// State per render thread using thread_local
 struct RenderState {
     swap_chain_ptr: *const c_void,
     swap_chain: Option<IDXGISwapChain3>,
@@ -97,7 +97,7 @@ impl RenderState {
         self.swap_chain_ptr = std::ptr::null();
         self.swap_chain = None;
         
-        // Don't clear command_queue_ptr!
+        // IMPORTANT: Don't clear command_queue_ptr!
         // Command queues are device-level and persist across swap chain changes
     }
     
@@ -421,33 +421,10 @@ fn get_target_addrs() -> (
         let resize_buffers_ptr = *sc_vtable.add(13);
         let execute_command_lists_ptr = *q_vtable.add(10);
         
-        debug!("Vtable addresses extracted:");
-        debug!("  Present:              {:p}", present_ptr as *const c_void);
-        debug!("  ResizeBuffers:        {:p}", resize_buffers_ptr as *const c_void);
-        debug!("  ExecuteCommandLists:  {:p}", execute_command_lists_ptr as *const c_void);
-        
-        let windows_present = swap_chain.vtable().Present as *const c_void;
-        let windows_resize = swap_chain.vtable().ResizeBuffers as *const c_void;
-        let windows_execute = command_queue.vtable().ExecuteCommandLists as *const c_void;
-        
-        if present_ptr as *const c_void != windows_present {
-            warn!(
-                "Present vtable mismatch! Manual: {:p}, Windows-rs: {:p}",
-                present_ptr as *const c_void, windows_present
-            );
-        }
-        if resize_buffers_ptr as *const c_void != windows_resize {
-            warn!(
-                "ResizeBuffers vtable mismatch! Manual: {:p}, Windows-rs: {:p}",
-                resize_buffers_ptr as *const c_void, windows_resize
-            );
-        }
-        if execute_command_lists_ptr as *const c_void != windows_execute {
-            warn!(
-                "ExecuteCommandLists vtable mismatch! Manual: {:p}, Windows-rs: {:p}",
-                execute_command_lists_ptr as *const c_void, windows_execute
-            );
-        }
+        debug!("Vtable addresses:");
+        debug!("  Present: {:p}", present_ptr as *const c_void);
+        debug!("  ResizeBuffers: {:p}", resize_buffers_ptr as *const c_void);
+        debug!("  ExecuteCommandLists: {:p}", execute_command_lists_ptr as *const c_void);
         
         (
             mem::transmute(present_ptr),
