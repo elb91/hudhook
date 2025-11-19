@@ -1,11 +1,10 @@
 //! Hooks for DirectX 12.
 //! 
-//! Fixed version based on stable D3D12Hook.cpp implementation
-//! Key fixes:
-//! - Proper command queue selection (priority 1 or 5)
-//! - Safe resource cleanup in ResizeBuffers
-//! - No cloning of COM objects
-//! - Deferred pipeline cleanup
+//! Fixed version - Key improvements:
+//! - Command queue selection by num_command_lists (game uses 5+, our test uses 1)
+//! - Safe resource cleanup (command queue persists across swap chain changes)
+//! - No COM object cloning (store raw pointers)
+//! - Proper cleanup order in ResizeBuffers
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -14,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use imgui::Context;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, trace};
 use windows::core::{Error, Interface, Result, HRESULT};
 use windows::Win32::Foundation::BOOL;
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
@@ -84,29 +83,22 @@ impl RenderState {
     }
     
     fn reset(&mut self) {
-        debug!("RenderState::reset called");
-        
-        // Mark as uninitialized first
         self.initialized = false;
         
         // Clean up pipeline if it exists
         if let Some(mut pipeline) = self.pipeline.take() {
-            debug!("Cleaning up pipeline");
-            let cleanup_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 pipeline.cleanup();
             }));
-            if cleanup_result.is_err() {
-                error!("Pipeline cleanup panicked!");
-            }
             drop(pipeline);
         }
         
-        // Clear references (don't drop COM objects that game owns)
+        // Clear swap chain references
         self.swap_chain_ptr = std::ptr::null();
         self.swap_chain = None;
-        self.command_queue_ptr = std::ptr::null_mut();
         
-        debug!("RenderState reset complete");
+        // Don't clear command_queue_ptr!
+        // Command queues are device-level and persist across swap chain changes
     }
     
     // Validate that swap chain hasn't changed
@@ -157,9 +149,8 @@ fn render(swap_chain: &IDXGISwapChain3, swap_chain_ptr: *const c_void) -> Result
     RENDER_STATE.with(|state_cell| {
         let mut state = state_cell.borrow_mut();
         
-        // Validate swap chain hasn't changed
+        // Validate swap chain
         if !state.validate_swap_chain(swap_chain_ptr) {
-            error!("Swap chain validation failed - skipping render");
             return Ok(());
         }
         
@@ -168,12 +159,10 @@ fn render(swap_chain: &IDXGISwapChain3, swap_chain_ptr: *const c_void) -> Result
             let command_queue = unsafe { state.get_command_queue() };
             
             if let (Some(sc), Some(cq)) = (&state.swap_chain, command_queue) {
-                debug!("Initializing pipeline...");
                 match unsafe { init_pipeline(sc, &cq) } {
                     Ok(pipeline) => {
                         state.pipeline = Some(pipeline);
                         state.initialized = true;
-                        debug!("Pipeline initialized successfully");
                     }
                     Err(e) => {
                         error!("Failed to initialize pipeline: {:?}", e);
@@ -181,14 +170,11 @@ fn render(swap_chain: &IDXGISwapChain3, swap_chain_ptr: *const c_void) -> Result
                     }
                 }
             } else {
-                // Not ready yet - need both swap chain and command queue
-                trace!("Not ready to initialize: swap_chain={}, command_queue={}", 
-                       state.swap_chain.is_some(), state.command_queue_ptr.is_null());
                 return Ok(());
             }
         }
         
-        // Render with pipeline
+        // Render
         if let Some(pipeline) = &mut state.pipeline {
             pipeline.prepare_render()?;
             
@@ -210,19 +196,16 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
 ) -> HRESULT {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    static mut SKIP_FRAMES: u32 = 120; // Skip more frames at startup
+    static mut SKIP_FRAMES: u32 = 120;
     static mut LAST_SWAP_CHAIN_PTR: *const c_void = std::ptr::null();
     
     let current_ptr = swap_chain.as_raw() as *const c_void;
     
     // Handle swap chain changes
     if current_ptr != LAST_SWAP_CHAIN_PTR {
-        debug!("Swap chain changed: {:p} -> {:p}", LAST_SWAP_CHAIN_PTR, current_ptr);
-        
-        SKIP_FRAMES = 60; // Skip frames after swap chain change
+        SKIP_FRAMES = 60;
         RENDERING_ACTIVE.store(false, Ordering::Release);
         
-        // Reset state on swap chain change
         RENDER_STATE.with(|state_cell| {
             if let Ok(mut state) = state_cell.try_borrow_mut() {
                 state.reset();
@@ -235,9 +218,6 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
     // Skip frames during initialization
     if SKIP_FRAMES > 0 {
         SKIP_FRAMES -= 1;
-        if SKIP_FRAMES % 30 == 0 {
-            trace!("Skipping render, {} frames remaining", SKIP_FRAMES);
-        }
         
         let Trampolines { dxgi_swap_chain_present, .. } =
             TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
@@ -250,7 +230,6 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
             if state.swap_chain.is_none() {
                 state.swap_chain = Some(swap_chain.clone());
                 state.swap_chain_ptr = current_ptr;
-                debug!("Stored swap chain: {:p}", current_ptr);
             }
         }
     });
@@ -258,7 +237,7 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
     let Trampolines { dxgi_swap_chain_present, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
 
-    // Check if we can render (have both swap chain and command queue)
+    // Check if we can render
     let can_render = RENDER_STATE.with(|state_cell| {
         if let Ok(state) = state_cell.try_borrow() {
             state.validate_swap_chain(current_ptr) && 
@@ -278,11 +257,9 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
             Ok(Ok(())) => {},
             Ok(Err(e)) => {
                 error!("Render error: {e:?}");
-                util::print_dxgi_debug_messages();
-                // Don't disable rendering on transient errors
             },
             Err(_) => {
-                error!("Render panicked! Disabling rendering for 120 frames");
+                error!("Render panicked!");
                 SKIP_FRAMES = 120;
             }
         }
@@ -290,7 +267,6 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
         RENDERING_ACTIVE.store(false, Ordering::Release);
     }
 
-    trace!("Call IDXGISwapChain::Present trampoline");
     let result = dxgi_swap_chain_present(swap_chain, sync_interval, flags);
 
     if EJECT_REQUESTED.load(Ordering::SeqCst) {
@@ -310,38 +286,27 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
 ) -> HRESULT {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    debug!(
-        "ResizeBuffers called: buffer_count={}, width={}, height={}, format={:?}",
-        buffer_count, width, height, new_format
-    );
-    
     // Clear references BEFORE calling original
-    // This prevents use-after-free when game resizes resources
     RENDERING_ACTIVE.store(false, Ordering::Release);
     
     RENDER_STATE.with(|state_cell| {
         if let Ok(mut state) = state_cell.try_borrow_mut() {
-            // Mark as uninitialized but don't clean up pipeline yet
             state.initialized = false;
-            // Clear our references so we don't hold COM references during resize
             state.swap_chain = None;
-            state.command_queue_ptr = std::ptr::null_mut();
+            // Keep command_queue_ptr - it's still valid!
         }
     });
     
     let Trampolines { dxgi_swap_chain_resize_buffers, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
 
-    debug!("Calling original ResizeBuffers");
     let result = dxgi_swap_chain_resize_buffers(p_this, buffer_count, width, height, new_format, flags);
     
-    // NOW it's safe to clean up pipeline (after game has resized)
+    // Clean up pipeline after resize succeeded
     if result.is_ok() {
         RENDER_STATE.with(|state_cell| {
             if let Ok(mut state) = state_cell.try_borrow_mut() {
-                // Clean up pipeline after resize succeeded
                 if let Some(mut pipeline) = state.pipeline.take() {
-                    debug!("Cleaning up pipeline after ResizeBuffers");
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         pipeline.cleanup();
                     }));
@@ -351,7 +316,6 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
         });
     }
     
-    debug!("ResizeBuffers returned: {:?}", result);
     result
 }
 
@@ -362,24 +326,19 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
 ) {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    let desc = command_queue.GetDesc();
-    let priority = desc.Priority;
-    
-    debug!("ExecuteCommandLists called: Type={:?}, Priority={}, Lists={}", 
-           desc.Type, priority, num_command_lists);
-    
+    // Capture DIRECT command queues that submit 5+ lists (real game queues)
+    // Our test queue only submits 1 list, so we skip it
     RENDER_STATE.with(|state_cell| {
         if let Ok(mut state) = state_cell.try_borrow_mut() {
-            if desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT {
-                let queue_ptr = command_queue.as_raw() as *mut c_void;
-                
-                // Skip single command list submissions (likely our dummy queue)
-                // Game typically submits multiple lists (5+)
-                if num_command_lists >= 5 && state.command_queue_ptr.is_null() {
-                    debug!("Captured DIRECT command queue - Lists: {}, Address: {:?}", num_command_lists, queue_ptr);
+            let desc = command_queue.GetDesc();
+            
+            if desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT && state.command_queue_ptr.is_null() {
+                // Game queues typically submit 5+ command lists
+                // Our dummy test queue only submits 1
+                if num_command_lists >= 5 {
+                    let queue_ptr = command_queue.as_raw() as *mut c_void;
+                    debug!("Captured command queue (lists: {})", num_command_lists);
                     state.command_queue_ptr = queue_ptr;
-                } else if num_command_lists < 5 {
-                    trace!("Skipping queue with {} command lists (likely test queue)", num_command_lists);
                 }
             }
         }
@@ -390,6 +349,7 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
 
     d3d12_command_queue_execute_command_lists(command_queue, num_command_lists, command_lists);
 }
+
 fn get_target_addrs() -> (
     DXGISwapChainPresentType,
     DXGISwapChainResizeBuffersType,
@@ -466,8 +426,8 @@ fn get_target_addrs() -> (
         debug!("  ResizeBuffers:        {:p}", resize_buffers_ptr as *const c_void);
         debug!("  ExecuteCommandLists:  {:p}", execute_command_lists_ptr as *const c_void);
         
-        let windows_present = swap_chain.vtable().base__.base__.base__.Present as *const c_void;
-        let windows_resize = swap_chain.vtable().base__.base__.base__.ResizeBuffers as *const c_void;
+        let windows_present = swap_chain.vtable().Present as *const c_void;
+        let windows_resize = swap_chain.vtable().ResizeBuffers as *const c_void;
         let windows_execute = command_queue.vtable().ExecuteCommandLists as *const c_void;
         
         if present_ptr as *const c_void != windows_present {
