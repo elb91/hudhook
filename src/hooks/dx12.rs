@@ -1,20 +1,15 @@
 //! Hooks for DirectX 12.
 //! 
 //! Based on proven stable D3D12Hook.cpp implementation
-//! Critical fixes:
-//! 1. Single SKIP_FRAMES variable (not shadowed)
-//! 2. Proper cleanup with window proc restoration
-//! 3. GPU fence wait before resource cleanup
-//! 4. Safe transition handling
+//! Using thread_local + RefCell 
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use imgui::Context;
-use once_cell::sync::OnceCell;
-use parking_lot::Mutex;
 use tracing::{debug, error, trace, warn};
 use windows::core::{Error, Interface, Result, HRESULT};
 use windows::Win32::Foundation::BOOL;
@@ -64,75 +59,51 @@ struct Trampolines {
 
 static mut TRAMPOLINES: OnceLock<Trampolines> = OnceLock::new();
 
-enum InitializationContext {
-    Empty,
-    WithSwapChain(IDXGISwapChain3),
-    Complete(IDXGISwapChain3, ID3D12CommandQueue),
-    Done,
+// State per render thread using thread_local (stable pattern)
+struct RenderState {
+    swap_chain: Option<IDXGISwapChain3>,
+    command_queue: Option<ID3D12CommandQueue>,
+    pipeline: Option<Pipeline<D3D12RenderEngine>>,
+    initialized: bool,
 }
 
-impl InitializationContext {
-    fn insert_swap_chain(&mut self, swap_chain: &IDXGISwapChain3) {
-        *self = match mem::replace(self, InitializationContext::Empty) {
-            InitializationContext::Empty => {
-                InitializationContext::WithSwapChain(swap_chain.clone())
-            },
-            s => s,
-        }
-    }
-
-    fn insert_command_queue(&mut self, command_queue: &ID3D12CommandQueue) {
-        *self = match mem::replace(self, InitializationContext::Empty) {
-            InitializationContext::WithSwapChain(swap_chain) => {
-                let desc = unsafe { command_queue.GetDesc() };
-                
-                if desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT {
-                    debug!("Ignoring non-DIRECT command queue");
-                    *self = InitializationContext::WithSwapChain(swap_chain);
-                    return;
-                }
-                
-                debug!("Captured DIRECT command queue: {:?}", command_queue);
-                InitializationContext::Complete(swap_chain, command_queue.clone())
-            },
-            s => s,
-        }
-    }
-
-    fn get(&self) -> Option<(IDXGISwapChain3, ID3D12CommandQueue)> {
-        if let InitializationContext::Complete(swap_chain, command_queue) = self {
-            Some((swap_chain.clone(), command_queue.clone()))
-        } else {
-            None
-        }
-    }
-
-    fn done(&mut self) {
-        if let InitializationContext::Complete(..) = self {
-            *self = InitializationContext::Done;
+impl RenderState {
+    fn new() -> Self {
+        Self {
+            swap_chain: None,
+            command_queue: None,
+            pipeline: None,
+            initialized: false,
         }
     }
     
     fn reset(&mut self) {
-        *self = InitializationContext::Empty;
+        if let Some(mut pipeline) = self.pipeline.take() {
+            debug!("Cleaning up pipeline in reset");
+            pipeline.cleanup();
+            drop(pipeline);
+        }
+        self.swap_chain = None;
+        self.command_queue = None;
+        self.initialized = false;
     }
 }
 
-static INITIALIZATION_CONTEXT: Mutex<InitializationContext> =
-    Mutex::new(InitializationContext::Empty);
-static mut PIPELINE: OnceCell<Mutex<Pipeline<D3D12RenderEngine>>> = OnceCell::new();
-static mut RENDER_LOOP: OnceCell<Box<dyn ImguiRenderLoop + Send + Sync>> = OnceCell::new();
+thread_local! {
+    static RENDER_STATE: RefCell<RenderState> = RefCell::new(RenderState::new());
+}
 
-unsafe fn init_pipeline() -> Result<Mutex<Pipeline<D3D12RenderEngine>>> {
-    let Some((swap_chain, command_queue)) = ({ INITIALIZATION_CONTEXT.lock().get() }) else {
-        error!("Initialization context incomplete");
-        return Err(Error::from_hresult(HRESULT(-1)));
-    };
+static mut RENDER_LOOP: OnceLock<Box<dyn ImguiRenderLoop + Send + Sync>> = OnceCell::new();
+static PIPELINE_READY: AtomicBool = AtomicBool::new(false);
 
+unsafe fn init_pipeline(
+    swap_chain: &IDXGISwapChain3,
+    command_queue: &ID3D12CommandQueue,
+) -> Result<Pipeline<D3D12RenderEngine>> {
     let hwnd = util::try_out_param(|v| swap_chain.GetDesc(v)).map(|desc| desc.OutputWindow)?;
 
     let mut ctx = Context::create();
-    let engine = D3D12RenderEngine::new(&command_queue, &mut ctx)?;
+    let engine = D3D12RenderEngine::new(command_queue, &mut ctx)?;
 
     let Some(render_loop) = RENDER_LOOP.take() else {
         error!("Render loop not yet initialized");
@@ -144,31 +115,46 @@ unsafe fn init_pipeline() -> Result<Mutex<Pipeline<D3D12RenderEngine>>> {
         e
     })?;
 
-    {
-        INITIALIZATION_CONTEXT.lock().done();
-    }
-
-    Ok(Mutex::new(pipeline))
+    Ok(pipeline)
 }
 
 fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
-    unsafe {
-        let pipeline = PIPELINE.get_or_try_init(|| init_pipeline())?;
-
-        let Some(mut pipeline) = pipeline.try_lock() else {
-            error!("Could not lock pipeline");
-            return Err(Error::from_hresult(HRESULT(-1)));
-        };
-
-        pipeline.prepare_render()?;
-
-        let target: ID3D12Resource =
-            swap_chain.GetBuffer(swap_chain.GetCurrentBackBufferIndex())?;
-
-        pipeline.render(target)?;
-    }
-
-    Ok(())
+    RENDER_STATE.with(|state_cell| {
+        let mut state = state_cell.borrow_mut();
+        
+        // Initialize pipeline if needed
+        if !state.initialized {
+            if let (Some(sc), Some(cq)) = (&state.swap_chain, &state.command_queue) {
+                match unsafe { init_pipeline(sc, cq) } {
+                    Ok(pipeline) => {
+                        state.pipeline = Some(pipeline);
+                        state.initialized = true;
+                        PIPELINE_READY.store(true, Ordering::Release);
+                        debug!("Pipeline initialized successfully");
+                    }
+                    Err(e) => {
+                        error!("Failed to initialize pipeline: {:?}", e);
+                        return Err(e);
+                    }
+                }
+            } else {
+                return Err(Error::from_hresult(HRESULT(-1)));
+            }
+        }
+        
+        // Render with pipeline
+        if let Some(pipeline) = &mut state.pipeline {
+            pipeline.prepare_render()?;
+            
+            let target: ID3D12Resource = unsafe {
+                swap_chain.GetBuffer(swap_chain.GetCurrentBackBufferIndex())?
+            };
+            
+            pipeline.render(target)?;
+        }
+        
+        Ok(())
+    })
 }
 
 unsafe extern "system" fn dxgi_swap_chain_present_impl(
@@ -178,7 +164,7 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
 ) -> HRESULT {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    // Single SKIP_FRAMES declaration (not shadowed)
+    //  Single SKIP_FRAMES 
     static mut SKIP_FRAMES: u32 = 0;
     static mut LAST_SWAP_CHAIN_PTR: *const c_void = std::ptr::null();
     
@@ -188,21 +174,20 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
     if current_ptr != LAST_SWAP_CHAIN_PTR {
         error!("Swap chain changed: {:p} -> {:p}", LAST_SWAP_CHAIN_PTR, current_ptr);
         
-        SKIP_FRAMES = 10; // Skip next 10 frames
+        SKIP_FRAMES = 10;
         
-        if let Some(pipeline_mutex) = PIPELINE.take() {
-            // Extract Pipeline from Mutex
-            let mut pipeline = pipeline_mutex.into_inner();
-            debug!("Cleaning up pipeline on swap chain change");
-            pipeline.cleanup(); // Restores window proc!
-            drop(pipeline);     // GPU fence wait happens in Drop
-        }
+        // Reset state on swap chain change
+        RENDER_STATE.with(|state_cell| {
+            if let Ok(mut state) = state_cell.try_borrow_mut() {
+                state.reset();
+            }
+        });
         
-        INITIALIZATION_CONTEXT.lock().reset();
+        PIPELINE_READY.store(false, Ordering::Release);
         LAST_SWAP_CHAIN_PTR = current_ptr;
     }
     
-    // Check if we should skip rendering
+    // Check skip frames
     if SKIP_FRAMES > 0 {
         SKIP_FRAMES -= 1;
         trace!("Skipping render, {} frames remaining", SKIP_FRAMES);
@@ -212,26 +197,26 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
         return dxgi_swap_chain_present(swap_chain, sync_interval, flags);
     }
     
-    {
-        INITIALIZATION_CONTEXT.lock().insert_swap_chain(&swap_chain);
-    }
+    // Store swap chain for initialization
+    RENDER_STATE.with(|state_cell| {
+        if let Ok(mut state) = state_cell.try_borrow_mut() {
+            if state.swap_chain.is_none() {
+                state.swap_chain = Some(swap_chain.clone());
+            }
+        }
+    });
 
     let Trampolines { dxgi_swap_chain_present, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
 
-    let is_ready = {
-        let ctx = INITIALIZATION_CONTEXT.lock();
-        matches!(&*ctx, InitializationContext::Complete(_, _) | InitializationContext::Done)
-    };
-    
-    // Wrap render in catch_unwind to prevent crashes
-    if is_ready {
+    // Try to render if ready
+    if PIPELINE_READY.load(Ordering::Acquire) {
         let render_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             render(&swap_chain)
         }));
         
         match render_result {
-            Ok(Ok(())) => {}, // Success
+            Ok(Ok(())) => {},
             Ok(Err(e)) => {
                 error!("Render error: {e:?}");
                 util::print_dxgi_debug_messages();
@@ -239,6 +224,7 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
             Err(_) => {
                 error!("Render panicked! Disabling rendering for 60 frames");
                 SKIP_FRAMES = 60;
+                PIPELINE_READY.store(false, Ordering::Release);
             }
         }
     }
@@ -268,22 +254,16 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
         buffer_count, width, height, new_format
     );
     
-    debug!("ResizeBuffers - starting proper cleanup");
+    debug!("ResizeBuffers - resetting state");
     
-    if let Some(pipeline_mutex) = PIPELINE.take() {
-        // Extract Pipeline from Mutex
-        let mut pipeline = pipeline_mutex.into_inner();
-        debug!("Restoring window proc before pipeline drop");
-        pipeline.cleanup(); // must restore window proc before drop!
-        debug!("Dropping pipeline (GPU fence wait will occur)");
-        drop(pipeline);     // Drop impl waits for GPU fence
-    }
+    // Reset render state 
+    RENDER_STATE.with(|state_cell| {
+        if let Ok(mut state) = state_cell.try_borrow_mut() {
+            state.reset();
+        }
+    });
     
-    {
-        let mut ctx = INITIALIZATION_CONTEXT.lock();
-        ctx.reset();
-        debug!("Initialization context reset");
-    }
+    PIPELINE_READY.store(false, Ordering::Release);
     
     let Trampolines { dxgi_swap_chain_resize_buffers, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
@@ -306,9 +286,18 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
          {command_lists:p}) invoked",
     );
 
-    {
-        INITIALIZATION_CONTEXT.lock().insert_command_queue(&command_queue);
-    }
+    // Store DIRECT command queue
+    RENDER_STATE.with(|state_cell| {
+        if let Ok(mut state) = state_cell.try_borrow_mut() {
+            if state.command_queue.is_none() {
+                let desc = command_queue.GetDesc();
+                if desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT {
+                    debug!("Captured DIRECT command queue: {:?}", command_queue);
+                    state.command_queue = Some(command_queue.clone());
+                }
+            }
+        }
+    });
 
     let Trampolines { d3d12_command_queue_execute_command_lists, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
@@ -482,14 +471,14 @@ impl Hooks for ImguiDx12Hooks {
     unsafe fn unhook(&mut self) {
         TRAMPOLINES.take();
         
-        // Proper cleanup on unhook
-        if let Some(pipeline_mutex) = PIPELINE.take() {
-            let mut pipeline = pipeline_mutex.into_inner();
-            pipeline.cleanup();
-            drop(pipeline);
-        }
+        // Clean up render state
+        RENDER_STATE.with(|state_cell| {
+            if let Ok(mut state) = state_cell.try_borrow_mut() {
+                state.reset();
+            }
+        });
         
         RENDER_LOOP.take();
-        *INITIALIZATION_CONTEXT.lock() = InitializationContext::Empty;
+        PIPELINE_READY.store(false, Ordering::Release);
     }
 }
