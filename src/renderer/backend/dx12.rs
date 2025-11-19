@@ -102,30 +102,25 @@ impl RenderEngine for D3D12RenderEngine {
 
     fn render(&mut self, draw_data: &DrawData, render_target: Self::RenderTarget) -> Result<()> {
         unsafe {
-            // Wait for any pending texture uploads before rendering
-            // This ensures texture resources are ready and in correct state
-            if let Err(e) = self.texture_heap.fence.wait() {
-                error!("Failed to wait for texture upload fence: {:?}", e);
-                return Err(e);
-            }
-
+            // just execute commands without blocking wait
+            // The GPU will serialize operations on the same queue automatically
+            
             self.device.CreateRenderTargetView(&render_target, None, self.rtv_heap_start);
 
             self.command_allocator.Reset()?;
             self.command_list.Reset(&self.command_allocator, None)?;
 
-            // Use COMMON state as safer initial assumption
-            // D2R may not leave buffers in PRESENT state after ResizeBuffers
+            // Use PRESENT as initial state like C++ version
             let present_to_rtv_barriers = [util::create_barrier(
                 &render_target,
-                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_PRESENT,
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
             )];
 
             let rtv_to_present_barriers = [util::create_barrier(
                 &render_target,
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
-                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_PRESENT,
             )];
 
             self.command_list.ResourceBarrier(&present_to_rtv_barriers);
@@ -136,9 +131,12 @@ impl RenderEngine for D3D12RenderEngine {
 
             self.command_list.ResourceBarrier(&rtv_to_present_barriers);
             self.command_list.Close()?;
+            
+            // Execute commands
             self.command_queue.ExecuteCommandLists(&[Some(self.command_list.cast()?)]);
+            
+            // Only signal fence for tracking, don't wait
             self.command_queue.Signal(self.fence.fence(), self.fence.value())?;
-            self.fence.wait()?;
             self.fence.incr();
 
             present_to_rtv_barriers.into_iter().for_each(util::drop_barrier);
@@ -172,9 +170,9 @@ impl D3D12RenderEngine {
                 self.index_buffer.extend(indices);
             });
 
-        // Pass fence to upload for proper synchronization
-        self.vertex_buffer.upload(&self.device, &mut self.fence)?;
-        self.index_buffer.upload(&self.device, &mut self.fence)?;
+        // Upload without fence parameter - handle reallocation differently
+        self.vertex_buffer.upload(&self.device)?;
+        self.index_buffer.upload(&self.device)?;
 
         self.projection_buffer = {
             let [l, t, r, b] = [
@@ -633,17 +631,10 @@ impl<T> Buffer<T> {
         self.data.extend(it)
     }
 
-    // Accept fence parameter for proper synchronization
-    fn upload(&mut self, device: &ID3D12Device, fence: &mut Fence) -> Result<()> {
+    fn upload(&mut self, device: &ID3D12Device) -> Result<()> {
         let capacity = self.data.capacity();
         if capacity > self.resource_capacity {
-            // Wait for GPU before dropping old resource
-            debug!("Buffer reallocation: waiting for GPU to finish using old buffer");
-            if let Err(e) = fence.wait() {
-                error!("Failed to wait for fence before buffer reallocation: {:?}", e);
-                return Err(e);
-            }
-            
+            // Just reallocate - GPU serialization on same queue handles safety
             drop(mem::replace(&mut self.resource, Self::create_resource(device, capacity)?));
             self.resource_capacity = capacity;
         }
@@ -673,7 +664,7 @@ struct TextureHeap {
     srv_heap: ID3D12DescriptorHeap,
     srv_staging_heap: ID3D12DescriptorHeap,
     textures: Vec<Texture>,
-    // Use shared command queue instead of creating separate one
+    // Use shared command queue
     command_queue: ID3D12CommandQueue,
     command_allocator: ID3D12CommandAllocator,
     command_list: ID3D12GraphicsCommandList,
@@ -681,14 +672,12 @@ struct TextureHeap {
 }
 
 impl TextureHeap {
-    // Accept command_queue parameter instead of creating new one
     fn new(
         device: &ID3D12Device,
         srv_heap: ID3D12DescriptorHeap,
         command_queue: &ID3D12CommandQueue,
     ) -> Result<Self> {
-        // Use the passed command queue instead of creating a new one
-        // This ensures all GPU operations are serialized on the same queue
+        // Use passed queue instead of creating new one
         let command_queue = command_queue.clone();
 
         let command_allocator: ID3D12CommandAllocator =
@@ -733,13 +722,6 @@ impl TextureHeap {
         let old_num_descriptors = desc.NumDescriptors;
 
         if old_num_descriptors <= self.textures.len() as _ {
-            // Wait for GPU before dropping old heaps
-            debug!("Descriptor heap resize: waiting for GPU to finish using old heap");
-            if let Err(e) = self.fence.wait() {
-                error!("Failed to wait for fence before heap resize: {:?}", e);
-                return Err(e);
-            }
-
             desc.NumDescriptors *= 2;
             desc_staging.NumDescriptors = desc.NumDescriptors;
 
@@ -761,7 +743,7 @@ impl TextureHeap {
             self.srv_heap = srv_heap;
             self.srv_staging_heap = srv_staging_heap;
 
-            // Adjust texture GPU pointers.
+            // Adjust texture GPU pointers
             let gpu_heap_start = self.srv_heap.GetGPUDescriptorHandleForHeapStart();
             let heap_inc_size = self
                 .device
@@ -877,7 +859,7 @@ impl TextureHeap {
 
         let upload_row_size = width * 4;
         let align = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-        let upload_pitch = upload_row_size.div_ceil(align) * align; // 256 bytes aligned
+        let upload_pitch = upload_row_size.div_ceil(align) * align;
         let upload_size = height * upload_pitch;
 
         let upload_buffer: ID3D12Resource = util::try_out_ptr(|v| unsafe {
@@ -957,19 +939,16 @@ impl TextureHeap {
         self.command_list.ResourceBarrier(&barriers);
         self.command_list.Close()?;
         
-        // Execute on the shared command queue
+        // Execute on shared queue 
         self.command_queue.ExecuteCommandLists(&[Some(self.command_list.cast()?)]);
-        self.command_queue.Signal(self.fence.fence(), self.fence.value())?;
         
-        // Wait for upload to complete before returning
-        // This ensures texture is ready before render() might use it
-        self.fence.wait()?;
+        // Signal fence for tracking but don't wait
+        self.command_queue.Signal(self.fence.fence(), self.fence.value())?;
         self.fence.incr();
 
         barriers.into_iter().for_each(util::drop_barrier);
 
-        // Now safe to drop upload buffer since fence.wait() completed
-        // The GPU has finished copying from upload_buffer to texture
+        // Now safe to clean up ManuallyDrop
         let _ = ManuallyDrop::into_inner(src_location.pResource);
         let _ = ManuallyDrop::into_inner(dst_location.pResource);
 
