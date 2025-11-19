@@ -93,7 +93,7 @@ thread_local! {
     static RENDER_STATE: RefCell<RenderState> = RefCell::new(RenderState::new());
 }
 
-static mut RENDER_LOOP: OnceLock<Box<dyn ImguiRenderLoop + Send + Sync>> = OnceCell::new();
+static mut RENDER_LOOP: OnceLock<Box<dyn ImguiRenderLoop + Send + Sync>> = OnceLock::new();
 static PIPELINE_READY: AtomicBool = AtomicBool::new(false);
 
 unsafe fn init_pipeline(
