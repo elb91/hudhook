@@ -83,34 +83,25 @@ impl InitializationContext {
     }
 
     // Check that command queue is DIRECT type before accepting it
-    fn insert_command_queue(&mut self, command_queue: &ID3D12CommandQueue) {
-        *self = match mem::replace(self, InitializationContext::Empty) {
-            InitializationContext::WithSwapChain(swap_chain) => {
-                // Only accept DIRECT command queues 
-                let desc = unsafe { command_queue.GetDesc() };
-                
-                if desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT {
-                    debug!(
-                        "Ignoring command queue {:?} with type {:?} (not DIRECT)",
-                        command_queue, desc.Type
-                    );
-                   *self = InitializationContext::WithSwapChain(swap_chain);
-                    return;
-                }
-                
-                if unsafe { Self::check_command_queue(&swap_chain, command_queue) } {
-                    trace!(
-                        "Found DIRECT command queue matching swap chain {swap_chain:?} at \
-                         {command_queue:?}"
-                    );
-                    InitializationContext::Complete(swap_chain, command_queue.clone())
-                } else {
-                    InitializationContext::WithSwapChain(swap_chain)
-                }
-            },
-            s => s,
-        }
+  fn insert_command_queue(&mut self, command_queue: &ID3D12CommandQueue) {
+    *self = match mem::replace(self, InitializationContext::Empty) {
+        InitializationContext::WithSwapChain(swap_chain) => {
+            let desc = unsafe { command_queue.GetDesc() };
+            
+            if desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT {
+                debug!("Ignoring non-DIRECT command queue");
+                *self = InitializationContext::WithSwapChain(swap_chain);
+                return;
+            }
+            
+            //Just accept the first DIRECT queue (like D3D12Hook.cpp)
+            // Don't try to validate it's in the swap chain struct
+            debug!("Captured DIRECT command queue: {:?}", command_queue);
+            InitializationContext::Complete(swap_chain, command_queue.clone())
+        },
+        s => s,
     }
+}
 
     // Retrieve the values if the context is complete.
     fn get(&self) -> Option<(IDXGISwapChain3, ID3D12CommandQueue)> {
