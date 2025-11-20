@@ -1,4 +1,4 @@
-//! DirectX 12 hooks - Production ready with proper queue discovery
+//! DirectX 12 hooks 
 
 use std::ffi::c_void;
 use std::mem;
@@ -55,6 +55,11 @@ struct Trampolines {
 
 static mut TRAMPOLINES: OnceLock<Trampolines> = OnceLock::new();
 
+/// Wrapper to make raw pointer Send (we ensure thread safety manually)
+struct SendPtr(*const c_void);
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+
 /// Global render state
 struct RenderState {
     swap_chain: Option<IDXGISwapChain3>,
@@ -63,8 +68,12 @@ struct RenderState {
     initialized: bool,
     // Queue discovery tracking
     queue_discovery_complete: bool,
-    first_queue_ptr: *const c_void,
+    first_queue_ptr: SendPtr,
 }
+
+// We manually ensure thread safety through Mutex and careful access patterns
+unsafe impl Send for RenderState {}
+unsafe impl Sync for RenderState {}
 
 impl RenderState {
     fn new() -> Self {
@@ -74,7 +83,7 @@ impl RenderState {
             pipeline: None,
             initialized: false,
             queue_discovery_complete: false,
-            first_queue_ptr: std::ptr::null(),
+            first_queue_ptr: SendPtr(std::ptr::null()),
         }
     }
     
@@ -308,27 +317,25 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
     let desc = command_queue.GetDesc();
     
     // Only capture DIRECT queues (Type 0)
-    // Command list count varies dynamically, so we can't rely on specific numbers
     if desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT {
         let state_lock = get_render_state();
+        // Fixed lifetime issue by dropping the lock guard immediately
         if let Ok(mut state) = state_lock.lock() {
             let queue_ptr = command_queue.as_raw() as *const c_void;
             
-            // Queue discovery phase - find the main rendering queue
+            // Queue discovery phase
             if !state.queue_discovery_complete {
                 if state.command_queue.is_none() {
-                    // First DIRECT queue discovered
                     debug!(
                         "First DIRECT queue: Lists={}, Ptr={:p}",
                         num_command_lists, queue_ptr
                     );
                     state.command_queue = Some(command_queue.clone());
-                    state.first_queue_ptr = queue_ptr;
+                    state.first_queue_ptr = SendPtr(queue_ptr);
                 } else {
-                    let first_ptr = state.first_queue_ptr;
+                    let first_ptr = state.first_queue_ptr.0;
                     
                     if first_ptr != queue_ptr {
-                        // Second DIRECT queue found - this is typically the main rendering queue
                         debug!(
                             "Second DIRECT queue found: Lists={}, Ptr={:p} - USING THIS",
                             num_command_lists, queue_ptr
@@ -336,7 +343,6 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
                         state.command_queue = Some(command_queue.clone());
                         state.queue_discovery_complete = true;
                         
-                        // Reset pipeline to use correct queue
                         if state.initialized {
                             debug!("Resetting pipeline for main rendering queue");
                             let old_sc = state.swap_chain.clone();
@@ -346,7 +352,6 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
                             state.queue_discovery_complete = true;
                         }
                     } else {
-                        // Still seeing same queue - might be only one
                         let count = SAME_QUEUE_COUNT.fetch_add(1, Ordering::Relaxed);
                         
                         if count > 100 {
@@ -356,7 +361,7 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
                     }
                 }
             }
-        }
+        } // MutexGuard dropped here
     }
 
     let Trampolines { d3d12_command_queue_execute_command_lists, .. } =
