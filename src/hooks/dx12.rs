@@ -66,6 +66,7 @@ struct RenderState {
     command_queue: Option<ID3D12CommandQueue>,
     pipeline: Option<Pipeline<D3D12RenderEngine>>,
     initialized: bool,
+    initializing: bool,
     // Queue discovery tracking
     queue_discovery_complete: bool,
     first_queue_ptr: SendPtr,
@@ -82,6 +83,7 @@ impl RenderState {
             command_queue: None,
             pipeline: None,
             initialized: false,
+            initializing: false,
             queue_discovery_complete: false,
             first_queue_ptr: SendPtr(std::ptr::null()),
         }
@@ -100,6 +102,7 @@ impl RenderState {
         self.swap_chain = None;
         self.command_queue = None;
         self.initialized = false;
+        self.initializing = false;
         // Don't reset queue_discovery_complete - we already know which queue to use
         
         debug!("RenderState reset complete");
@@ -148,31 +151,63 @@ unsafe fn init_pipeline(
 
 fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
     let state_lock = get_render_state();
-    let mut state = state_lock.lock().unwrap();
     
-    if !state.initialized {
+    // Check if we should initialize (without holding lock for long)
+    let should_init = {
+        let mut state = state_lock.lock().unwrap();
+        
+        // Update swap chain if needed
         if state.swap_chain.is_none() {
             state.swap_chain = Some(swap_chain.clone());
         }
         
-        if let (Some(sc), Some(cq)) = (&state.swap_chain, &state.command_queue) {
-            debug!("Both swap chain and command queue available - initializing");
-            
-            match unsafe { init_pipeline(sc, cq) } {
-                Ok(pipeline) => {
-                    state.pipeline = Some(pipeline);
-                    state.initialized = true;
-                    debug!("Pipeline ready for rendering");
-                }
-                Err(e) => {
-                    error!("Failed to initialize pipeline: {:?}", e);
-                    return Err(e);
-                }
-            }
+        // Check if we should start initialization
+        if !state.initialized && !state.initializing 
+            && state.swap_chain.is_some() 
+            && state.command_queue.is_some() {
+            state.initializing = true;
+            true
         } else {
-            trace!("Waiting for command queue before initialization");
-            return Ok(());
+            false
         }
+    }; // Lock released here
+    
+    if should_init {
+        debug!("Both swap chain and command queue available - initializing");
+        
+        // Get resources without holding the lock
+        let (sc, cq) = {
+            let state = state_lock.lock().unwrap();
+            (state.swap_chain.clone().unwrap(), state.command_queue.clone().unwrap())
+        }; // Lock released here
+        
+        // Initialize pipeline WITHOUT holding lock (prevents deadlock)
+        let init_result = unsafe { init_pipeline(&sc, &cq) };
+        
+        // Store result while holding lock
+        match init_result {
+            Ok(pipeline) => {
+                let mut state = state_lock.lock().unwrap();
+                state.pipeline = Some(pipeline);
+                state.initialized = true;
+                state.initializing = false;
+                debug!("Pipeline ready for rendering");
+            }
+            Err(e) => {
+                error!("Failed to initialize pipeline: {:?}", e);
+                let mut state = state_lock.lock().unwrap();
+                state.initializing = false;
+                return Err(e);
+            }
+        }
+    }
+    
+    // Render with the pipeline
+    let mut state = state_lock.lock().unwrap();
+    
+    if !state.initialized || state.initializing {
+        trace!("Waiting for initialization");
+        return Ok(());
     }
     
     if let Some(pipeline) = &mut state.pipeline {
