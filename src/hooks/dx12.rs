@@ -63,13 +63,12 @@ unsafe impl Sync for SendPtr {}
 /// Global render state
 struct RenderState {
     swap_chain: Option<IDXGISwapChain3>,
+    swap_chain_ptr: SendPtr,
     command_queue: Option<ID3D12CommandQueue>,
+    command_queue_ptr: SendPtr,
     pipeline: Option<Pipeline<D3D12RenderEngine>>,
     initialized: bool,
     initializing: bool,
-    // Queue discovery tracking
-    queue_discovery_complete: bool,
-    first_queue_ptr: SendPtr,
 }
 
 // We manually ensure thread safety through Mutex and careful access patterns
@@ -80,16 +79,16 @@ impl RenderState {
     fn new() -> Self {
         Self {
             swap_chain: None,
+            swap_chain_ptr: SendPtr(std::ptr::null()),
             command_queue: None,
+            command_queue_ptr: SendPtr(std::ptr::null()),
             pipeline: None,
             initialized: false,
             initializing: false,
-            queue_discovery_complete: false,
-            first_queue_ptr: SendPtr(std::ptr::null()),
         }
     }
     
-    /// Reset state but preserve queue discovery info
+    /// Reset state completely
     fn reset(&mut self) {
         debug!("RenderState::reset - cleaning up resources");
         
@@ -100,12 +99,53 @@ impl RenderState {
         }
         
         self.swap_chain = None;
+        self.swap_chain_ptr = SendPtr(std::ptr::null());
         self.command_queue = None;
+        self.command_queue_ptr = SendPtr(std::ptr::null());
         self.initialized = false;
         self.initializing = false;
-        // Don't reset queue_discovery_complete - we already know which queue to use
         
         debug!("RenderState reset complete");
+    }
+    
+    /// Check if swap chain or command queue changed
+    fn has_context_changed(&self, swap_chain: &IDXGISwapChain3, command_queue: &ID3D12CommandQueue) -> bool {
+        let sc_ptr = swap_chain.as_raw() as *const c_void;
+        let cq_ptr = command_queue.as_raw() as *const c_void;
+        
+        self.swap_chain_ptr.0 != sc_ptr || self.command_queue_ptr.0 != cq_ptr
+    }
+    
+    /// Update context and mark for re-initialization if changed
+    fn update_context(&mut self, swap_chain: &IDXGISwapChain3, command_queue: &ID3D12CommandQueue) -> bool {
+        let sc_ptr = swap_chain.as_raw() as *const c_void;
+        let cq_ptr = command_queue.as_raw() as *const c_void;
+        
+        let changed = self.swap_chain_ptr.0 != sc_ptr || self.command_queue_ptr.0 != cq_ptr;
+        
+        if changed {
+            debug!(
+                "Context changed - SwapChain: {:p} -> {:p}, Queue: {:p} -> {:p}",
+                self.swap_chain_ptr.0, sc_ptr,
+                self.command_queue_ptr.0, cq_ptr
+            );
+            
+            // Clean up old pipeline
+            if let Some(mut pipeline) = self.pipeline.take() {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pipeline.cleanup();
+                }));
+            }
+            
+            self.swap_chain = Some(swap_chain.clone());
+            self.swap_chain_ptr = SendPtr(sc_ptr);
+            self.command_queue = Some(command_queue.clone());
+            self.command_queue_ptr = SendPtr(cq_ptr);
+            self.initialized = false;
+            self.initializing = false;
+        }
+        
+        changed
     }
 }
 
@@ -119,7 +159,6 @@ fn get_render_state() -> Arc<Mutex<RenderState>> {
 
 static mut RENDER_LOOP: OnceLock<Box<dyn ImguiRenderLoop + Send + Sync>> = OnceLock::new();
 static RENDERING: AtomicBool = AtomicBool::new(false);
-static SAME_QUEUE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 unsafe fn init_pipeline(
     swap_chain: &IDXGISwapChain3,
@@ -149,22 +188,24 @@ unsafe fn init_pipeline(
     Ok(pipeline)
 }
 
-fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
+fn render(swap_chain: &IDXGISwapChain3, command_queue: &ID3D12CommandQueue) -> Result<()> {
     let state_lock = get_render_state();
     
-    // Check if we should initialize (without holding lock for long)
+    // Check if context changed or needs initialization
     let should_init = {
         let mut state = state_lock.lock().unwrap();
         
-        // Update swap chain if needed
-        if state.swap_chain.is_none() {
-            state.swap_chain = Some(swap_chain.clone());
-        }
-        
-        // Check if we should start initialization
-        if !state.initialized && !state.initializing 
-            && state.swap_chain.is_some() 
-            && state.command_queue.is_some() {
+        // Check for context change (different swap chain or queue)
+        if state.initialized {
+            if state.has_context_changed(swap_chain, command_queue) {
+                state.update_context(swap_chain, command_queue);
+                true
+            } else {
+                false
+            }
+        } else if !state.initializing {
+            // First initialization
+            state.update_context(swap_chain, command_queue);
             state.initializing = true;
             true
         } else {
@@ -173,16 +214,10 @@ fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
     }; // Lock released here
     
     if should_init {
-        debug!("Both swap chain and command queue available - initializing");
-        
-        // Get resources without holding the lock
-        let (sc, cq) = {
-            let state = state_lock.lock().unwrap();
-            (state.swap_chain.clone().unwrap(), state.command_queue.clone().unwrap())
-        }; // Lock released here
+        debug!("Initializing rendering pipeline for current context");
         
         // Initialize pipeline WITHOUT holding lock (prevents deadlock)
-        let init_result = unsafe { init_pipeline(&sc, &cq) };
+        let init_result = unsafe { init_pipeline(swap_chain, command_queue) };
         
         // Store result while holding lock
         match init_result {
@@ -213,6 +248,7 @@ fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
         return Ok(());
     }
     
+    // Get the pipeline WITHOUT holding the lock during render
     let pipeline = {
         let mut state = state_lock.lock().unwrap();
         state.pipeline.as_mut().map(|p| p as *mut Pipeline<D3D12RenderEngine>)
@@ -223,7 +259,7 @@ fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
         // The pipeline remains valid because we never drop it while rendering
         let pipeline = unsafe { &mut *pipeline_ptr };
         
-  
+        // Render WITHOUT holding any locks
         pipeline.prepare_render()?;
         
         let target: ID3D12Resource = unsafe {
@@ -244,26 +280,6 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
     let _hook_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
     static mut SKIP_FRAMES: u32 = 60;
-    static mut LAST_SWAP_CHAIN_PTR: *const c_void = std::ptr::null();
-    
-    let current_ptr = swap_chain.as_raw() as *const c_void;
-    
-    // Detect swap chain changes
-    if current_ptr != LAST_SWAP_CHAIN_PTR {
-        if !LAST_SWAP_CHAIN_PTR.is_null() {
-            error!("Swap chain changed: {:p} -> {:p}", LAST_SWAP_CHAIN_PTR, current_ptr);
-            
-            let state_lock = get_render_state();
-            if let Ok(mut state) = state_lock.lock() {
-                state.reset();
-                state.swap_chain = Some(swap_chain.clone());
-            }
-            
-            SKIP_FRAMES = 60;
-            RENDERING.store(false, Ordering::Release);
-        }
-        LAST_SWAP_CHAIN_PTR = current_ptr;
-    }
     
     // Skip frames if needed
     if SKIP_FRAMES > 0 {
@@ -280,21 +296,36 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
 
     // Try to render (only one render at a time)
     if RENDERING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-        let render_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            render(&swap_chain)
-        }));
+        // Get current command queue
+        let state_lock = get_render_state();
+        let command_queue = {
+            let state = state_lock.lock().unwrap();
+            state.command_queue.clone()
+        };
         
-        match render_result {
-            Ok(Ok(())) => {
-                trace!("Frame rendered successfully");
-            },
-            Ok(Err(e)) => {
-                error!("Render error: {e:?}");
-                util::print_dxgi_debug_messages();
-            },
-            Err(_) => {
-                error!("Render panicked - skipping 60 frames");
-                SKIP_FRAMES = 60;
+        if let Some(cq) = command_queue {
+            let render_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                render(&swap_chain, &cq)
+            }));
+            
+            match render_result {
+                Ok(Ok(())) => {
+                    trace!("Frame rendered successfully");
+                },
+                Ok(Err(e)) => {
+                    error!("Render error: {e:?}");
+                    util::print_dxgi_debug_messages();
+                },
+                Err(_) => {
+                    error!("Render panicked - skipping 60 frames");
+                    SKIP_FRAMES = 60;
+                    
+                    // Reset state on panic
+                    let state_lock = get_render_state();
+                    if let Ok(mut state) = state_lock.lock() {
+                        state.reset();
+                    }
+                }
             }
         }
         
@@ -321,7 +352,7 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
 ) -> HRESULT {
     let _hook_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    error!(
+    debug!(
         "ResizeBuffers called: {}x{}, buffers={}, format={:?}",
         width, height, buffer_count, new_format
     );
@@ -349,7 +380,7 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
     if result.is_err() {
         error!("ResizeBuffers failed: {:?}", result);
     } else {
-        debug!("ResizeBuffers succeeded");
+        debug!("ResizeBuffers succeeded - will re-initialize on next frame");
     }
     
     result
@@ -367,60 +398,24 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
     // Only capture DIRECT queues (Type 0)
     if desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT {
         let state_lock = get_render_state();
-        let mut state = match state_lock.lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                error!("Failed to lock render state");
-                let Trampolines { d3d12_command_queue_execute_command_lists, .. } =
-                    TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
-                d3d12_command_queue_execute_command_lists(command_queue, num_command_lists, command_lists);
-                return;
-            }
-        };
-        
-        let queue_ptr = command_queue.as_raw() as *const c_void;
-        
-        // Queue discovery phase
-        if !state.queue_discovery_complete {
-            if state.command_queue.is_none() {
-                debug!(
-                    "First DIRECT queue: Lists={}, Ptr={:p}",
-                    num_command_lists, queue_ptr
-                );
-                state.command_queue = Some(command_queue.clone());
-                state.first_queue_ptr = SendPtr(queue_ptr);
-            } else {
-                let first_ptr = state.first_queue_ptr.0;
-                
-                if first_ptr != queue_ptr {
+        if let Ok(mut state) = state_lock.lock() {
+            let queue_ptr = command_queue.as_raw() as *const c_void;
+            
+            // Update command queue if it changed or is unset
+            if state.command_queue_ptr.0 != queue_ptr {
+                if !state.command_queue_ptr.0.is_null() {
                     debug!(
-                        "Second DIRECT queue found: Lists={}, Ptr={:p} - USING THIS",
-                        num_command_lists, queue_ptr
+                        "Command queue changed: {:p} -> {:p}",
+                        state.command_queue_ptr.0, queue_ptr
                     );
-                    state.command_queue = Some(command_queue.clone());
-                    state.queue_discovery_complete = true;
-                    
-                    if state.initialized {
-                        debug!("Resetting pipeline for main rendering queue");
-                        let old_sc = state.swap_chain.clone();
-                        state.reset();
-                        state.swap_chain = old_sc;
-                        state.command_queue = Some(command_queue.clone());
-                        state.queue_discovery_complete = true;
-                    }
                 } else {
-                    let count = SAME_QUEUE_COUNT.fetch_add(1, Ordering::Relaxed);
-                    
-                    if count > 100 {
-                        debug!("Only one DIRECT queue exists - using it");
-                        state.queue_discovery_complete = true;
-                    }
+                    debug!("First DIRECT queue discovered: {:p}", queue_ptr);
                 }
+                
+                state.command_queue = Some(command_queue.clone());
+                state.command_queue_ptr = SendPtr(queue_ptr);
             }
         }
-        
-        // Explicitly drop the lock before calling trampoline
-        drop(state);
     }
 
     let Trampolines { d3d12_command_queue_execute_command_lists, .. } =
