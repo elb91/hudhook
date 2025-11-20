@@ -202,15 +202,28 @@ fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
         }
     }
     
-    // Render with the pipeline
-    let mut state = state_lock.lock().unwrap();
+    // Check if we're ready to render
+    let can_render = {
+        let state = state_lock.lock().unwrap();
+        state.initialized && !state.initializing
+    }; // Lock released
     
-    if !state.initialized || state.initializing {
+    if !can_render {
         trace!("Waiting for initialization");
         return Ok(());
     }
     
-    if let Some(pipeline) = &mut state.pipeline {
+    let pipeline = {
+        let mut state = state_lock.lock().unwrap();
+        state.pipeline.as_mut().map(|p| p as *mut Pipeline<D3D12RenderEngine>)
+    }; // Lock released here
+    
+    if let Some(pipeline_ptr) = pipeline {
+        //  We're the only thread that can access the pipeline due to RENDERING flag
+        // The pipeline remains valid because we never drop it while rendering
+        let pipeline = unsafe { &mut *pipeline_ptr };
+        
+  
         pipeline.prepare_render()?;
         
         let target: ID3D12Resource = unsafe {
