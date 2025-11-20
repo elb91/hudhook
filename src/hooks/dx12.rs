@@ -318,52 +318,61 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
     
     // Only capture DIRECT queues (Type 0)
     if desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT {
-        // Use explicit scope to ensure MutexGuard is dropped before calling trampoline
-        {
-            let state_lock = get_render_state();
-            if let Ok(mut state) = state_lock.lock() {
-                let queue_ptr = command_queue.as_raw() as *const c_void;
+        let state_lock = get_render_state();
+        let mut state = match state_lock.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                error!("Failed to lock render state");
+                let Trampolines { d3d12_command_queue_execute_command_lists, .. } =
+                    TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
+                d3d12_command_queue_execute_command_lists(command_queue, num_command_lists, command_lists);
+                return;
+            }
+        };
+        
+        let queue_ptr = command_queue.as_raw() as *const c_void;
+        
+        // Queue discovery phase
+        if !state.queue_discovery_complete {
+            if state.command_queue.is_none() {
+                debug!(
+                    "First DIRECT queue: Lists={}, Ptr={:p}",
+                    num_command_lists, queue_ptr
+                );
+                state.command_queue = Some(command_queue.clone());
+                state.first_queue_ptr = SendPtr(queue_ptr);
+            } else {
+                let first_ptr = state.first_queue_ptr.0;
                 
-                // Queue discovery phase
-                if !state.queue_discovery_complete {
-                    if state.command_queue.is_none() {
-                        debug!(
-                            "First DIRECT queue: Lists={}, Ptr={:p}",
-                            num_command_lists, queue_ptr
-                        );
+                if first_ptr != queue_ptr {
+                    debug!(
+                        "Second DIRECT queue found: Lists={}, Ptr={:p} - USING THIS",
+                        num_command_lists, queue_ptr
+                    );
+                    state.command_queue = Some(command_queue.clone());
+                    state.queue_discovery_complete = true;
+                    
+                    if state.initialized {
+                        debug!("Resetting pipeline for main rendering queue");
+                        let old_sc = state.swap_chain.clone();
+                        state.reset();
+                        state.swap_chain = old_sc;
                         state.command_queue = Some(command_queue.clone());
-                        state.first_queue_ptr = SendPtr(queue_ptr);
-                    } else {
-                        let first_ptr = state.first_queue_ptr.0;
-                        
-                        if first_ptr != queue_ptr {
-                            debug!(
-                                "Second DIRECT queue found: Lists={}, Ptr={:p} - USING THIS",
-                                num_command_lists, queue_ptr
-                            );
-                            state.command_queue = Some(command_queue.clone());
-                            state.queue_discovery_complete = true;
-                            
-                            if state.initialized {
-                                debug!("Resetting pipeline for main rendering queue");
-                                let old_sc = state.swap_chain.clone();
-                                state.reset();
-                                state.swap_chain = old_sc;
-                                state.command_queue = Some(command_queue.clone());
-                                state.queue_discovery_complete = true;
-                            }
-                        } else {
-                            let count = SAME_QUEUE_COUNT.fetch_add(1, Ordering::Relaxed);
-                            
-                            if count > 100 {
-                                debug!("Only one DIRECT queue exists - using it");
-                                state.queue_discovery_complete = true;
-                            }
-                        }
+                        state.queue_discovery_complete = true;
+                    }
+                } else {
+                    let count = SAME_QUEUE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    
+                    if count > 100 {
+                        debug!("Only one DIRECT queue exists - using it");
+                        state.queue_discovery_complete = true;
                     }
                 }
             }
-        } // MutexGuard and state_lock dropped here due to explicit scope
+        }
+        
+        // Explicitly drop the lock before calling trampoline
+        drop(state);
     }
 
     let Trampolines { d3d12_command_queue_execute_command_lists, .. } =
