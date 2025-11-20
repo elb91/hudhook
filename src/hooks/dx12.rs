@@ -63,11 +63,11 @@ struct Trampolines {
 static mut TRAMPOLINES: OnceLock<Trampolines> = OnceLock::new();
 static VTABLE_INIT_DONE: AtomicBool = AtomicBool::new(false);
 
+// Simple global command queue
+static mut COMMAND_QUEUE: *mut c_void = std::ptr::null_mut();
+
 // State per render thread using thread_local
 struct RenderState {
-    swap_chain_ptr: *const c_void,
-    swap_chain: Option<IDXGISwapChain3>,
-    command_queue_ptr: *mut c_void,  // Store raw pointer, don't clone COM object
     pipeline: Option<Pipeline<D3D12RenderEngine>>,
     initialized: bool,
 }
@@ -75,9 +75,6 @@ struct RenderState {
 impl RenderState {
     fn new() -> Self {
         Self {
-            swap_chain_ptr: std::ptr::null(),
-            swap_chain: None,
-            command_queue_ptr: std::ptr::null_mut(),
             pipeline: None,
             initialized: false,
         }
@@ -92,27 +89,6 @@ impl RenderState {
                 pipeline.cleanup();
             }));
             drop(pipeline);
-        }
-        
-        // Clear swap chain references
-        self.swap_chain_ptr = std::ptr::null();
-        self.swap_chain = None;
-        
-        // IMPORTANT: Don't clear command_queue_ptr!
-        // Command queues are device-level and persist across swap chain changes
-    }
-    
-    // Validate that swap chain hasn't changed
-    fn validate_swap_chain(&self, current_ptr: *const c_void) -> bool {
-        self.swap_chain_ptr == current_ptr || self.swap_chain_ptr.is_null()
-    }
-    
-    // Get command queue without cloning
-    unsafe fn get_command_queue(&self) -> Option<ID3D12CommandQueue> {
-        if self.command_queue_ptr.is_null() {
-            None
-        } else {
-            Some(ID3D12CommandQueue::from_raw(self.command_queue_ptr))
         }
     }
 }
@@ -146,32 +122,29 @@ unsafe fn init_pipeline(
     Ok(pipeline)
 }
 
-fn render(swap_chain: &IDXGISwapChain3, swap_chain_ptr: *const c_void) -> Result<()> {
+fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
     RENDER_STATE.with(|state_cell| {
         let mut state = state_cell.borrow_mut();
         
-        // Validate swap chain
-        if !state.validate_swap_chain(swap_chain_ptr) {
-            return Ok(());
-        }
-        
         // Initialize pipeline if needed
         if !state.initialized {
-            let command_queue = unsafe { state.get_command_queue() };
-            
-            if let (Some(sc), Some(cq)) = (&state.swap_chain, command_queue) {
-                match unsafe { init_pipeline(sc, &cq) } {
-                    Ok(pipeline) => {
-                        state.pipeline = Some(pipeline);
-                        state.initialized = true;
-                    }
-                    Err(e) => {
-                        error!("Failed to initialize pipeline: {:?}", e);
-                        return Err(e);
-                    }
+            // Get command queue
+            let command_queue = unsafe {
+                if COMMAND_QUEUE.is_null() {
+                    return Ok(()); // Not ready yet
                 }
-            } else {
-                return Ok(());
+                ID3D12CommandQueue::from_raw(COMMAND_QUEUE)
+            };
+            
+            match unsafe { init_pipeline(swap_chain, &command_queue) } {
+                Ok(pipeline) => {
+                    state.pipeline = Some(pipeline);
+                    state.initialized = true;
+                }
+                Err(e) => {
+                    error!("Failed to initialize pipeline: {:?}", e);
+                    return Err(e);
+                }
             }
         }
         
@@ -197,24 +170,14 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
 ) -> HRESULT {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    static mut SKIP_FRAMES: u32 = 120;
-    static mut LAST_SWAP_CHAIN_PTR: *const c_void = std::ptr::null();
-    
-    let current_ptr = swap_chain.as_raw() as *const c_void;
-    
-    // Handle swap chain changes
-    if current_ptr != LAST_SWAP_CHAIN_PTR {
-        SKIP_FRAMES = 60;
-        RENDERING_ACTIVE.store(false, Ordering::Release);
-        
-        RENDER_STATE.with(|state_cell| {
-            if let Ok(mut state) = state_cell.try_borrow_mut() {
-                state.reset();
-            }
-        });
-        
-        LAST_SWAP_CHAIN_PTR = current_ptr;
+    // if no command queue, just return original Present
+    if COMMAND_QUEUE.is_null() {
+        let Trampolines { dxgi_swap_chain_present, .. } =
+            TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
+        return dxgi_swap_chain_present(swap_chain, sync_interval, flags);
     }
+    
+    static mut SKIP_FRAMES: u32 = 120;
     
     // Skip frames during initialization
     if SKIP_FRAMES > 0 {
@@ -224,34 +187,14 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
             TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
         return dxgi_swap_chain_present(swap_chain, sync_interval, flags);
     }
-    
-    // Store swap chain for initialization
-    RENDER_STATE.with(|state_cell| {
-        if let Ok(mut state) = state_cell.try_borrow_mut() {
-            if state.swap_chain.is_none() {
-                state.swap_chain = Some(swap_chain.clone());
-                state.swap_chain_ptr = current_ptr;
-            }
-        }
-    });
 
     let Trampolines { dxgi_swap_chain_present, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
 
-    // Check if we can render
-    let can_render = RENDER_STATE.with(|state_cell| {
-        if let Ok(state) = state_cell.try_borrow() {
-            state.validate_swap_chain(current_ptr) && 
-            (state.initialized || (state.swap_chain.is_some() && !state.command_queue_ptr.is_null()))
-        } else {
-            false
-        }
-    });
-    
-    // Try to render if ready
-    if can_render && RENDERING_ACTIVE.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+    // Try to render
+    if RENDERING_ACTIVE.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
         let render_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            render(&swap_chain, current_ptr)
+            render(&swap_chain)
         }));
         
         match render_result {
@@ -287,37 +230,19 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
 ) -> HRESULT {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    // Clear references BEFORE calling original
+    // Reset state
     RENDERING_ACTIVE.store(false, Ordering::Release);
     
     RENDER_STATE.with(|state_cell| {
         if let Ok(mut state) = state_cell.try_borrow_mut() {
-            state.initialized = false;
-            state.swap_chain = None;
-            // Keep command_queue_ptr - it's still valid!
+            state.reset();
         }
     });
     
     let Trampolines { dxgi_swap_chain_resize_buffers, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
 
-    let result = dxgi_swap_chain_resize_buffers(p_this, buffer_count, width, height, new_format, flags);
-    
-    // Clean up pipeline after resize succeeded
-    if result.is_ok() {
-        RENDER_STATE.with(|state_cell| {
-            if let Ok(mut state) = state_cell.try_borrow_mut() {
-                if let Some(mut pipeline) = state.pipeline.take() {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        pipeline.cleanup();
-                    }));
-                }
-                state.swap_chain_ptr = std::ptr::null();
-            }
-        });
-    }
-    
-    result
+    dxgi_swap_chain_resize_buffers(p_this, buffer_count, width, height, new_format, flags)
 }
 
 unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
@@ -327,22 +252,14 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
 ) {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    // Only capture queues AFTER vtable initialization is complete
-    // This ensures we skip our dummy test queue
-    if VTABLE_INIT_DONE.load(Ordering::Acquire) {
-        RENDER_STATE.with(|state_cell| {
-            if let Ok(mut state) = state_cell.try_borrow_mut() {
-                let desc = command_queue.GetDesc();
-                
-                // Capture the FIRST DIRECT queue we see after init
-                // (matches what the working tool does)
-                if desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT && state.command_queue_ptr.is_null() {
-                    let queue_ptr = command_queue.as_raw() as *mut c_void;
-                    debug!("Captured first DIRECT command queue (lists: {})", num_command_lists);
-                    state.command_queue_ptr = queue_ptr;
-                }
-            }
-        });
+    // capture first DIRECT queue after vtable init
+    if VTABLE_INIT_DONE.load(Ordering::Acquire) && COMMAND_QUEUE.is_null() {
+        let desc = command_queue.GetDesc();
+        if desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT {
+            let queue_ptr = command_queue.as_raw() as *mut c_void;
+            debug!("Captured command queue");
+            COMMAND_QUEUE = queue_ptr;
+        }
     }
 
     let Trampolines { d3d12_command_queue_execute_command_lists, .. } =
