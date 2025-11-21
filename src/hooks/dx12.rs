@@ -200,10 +200,8 @@ fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
         
         // Don't start initializing if reinit is pending
         if REINIT_REQUESTED.load(Ordering::Acquire) {
-            return false;
-        }
-        
-        if !state.initialized && !state.initializing 
+            false
+        } else if !state.initialized && !state.initializing 
             && state.swap_chain.is_some() 
             && state.command_queue.is_some() {
             state.initializing = true;
