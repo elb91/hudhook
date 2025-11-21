@@ -272,7 +272,7 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
                 render(&swap_chain)
             }));
             
-            match render_result {
+              match render_result {
                 Ok(Ok(())) => {
                     trace!("Frame rendered successfully");
                 },
@@ -284,13 +284,11 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
                     error!("Render panicked - skipping 60 frames");
                     SKIP_FRAMES = 60;
                     
-                    // Reset state on panic 
-                    {
-                        let state_lock = get_render_state();
-                        if let Ok(mut state) = state_lock.lock() {
-                            state.reset();
-                        }
-                    } // state_lock dropped here
+                    // Reset state on panic
+                    let state_lock = get_render_state();
+                    if let Ok(mut state) = state_lock.lock() {
+                        state.reset();
+                    }
                 }
             }
         }
