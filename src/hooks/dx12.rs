@@ -291,7 +291,7 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
                             state.reset();
                         }
                     } // state_lock dropped here
-                }
+                };
             }
         }
         
