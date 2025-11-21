@@ -127,7 +127,6 @@ static RENDERING: AtomicBool = AtomicBool::new(false);
 static SAME_QUEUE_COUNT: AtomicU32 = AtomicU32::new(0);
 static SKIP_FRAMES: AtomicU32 = AtomicU32::new(60);
 static REINIT_REQUESTED: AtomicBool = AtomicBool::new(false);
-static REINIT_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Request a full reinitialization of the rendering pipeline
 pub fn request_reinit() {
@@ -158,9 +157,9 @@ unsafe fn init_pipeline(
     let render_loop_arc = RENDER_LOOP.get().expect("Render loop not initialized");
     let mut render_loop_guard = render_loop_arc.lock().unwrap();
     
-    // Check if render loop is available (might be taken during reinit)
+    // Check if render loop is available
     let Some(render_loop_box) = render_loop_guard.take() else {
-        error!("Render loop not available - possibly taken during reinit");
+        error!("Render loop not available during init_pipeline");
         return Err(Error::from_hresult(HRESULT(-1)));
     };
 
@@ -181,9 +180,9 @@ unsafe fn init_pipeline(
 }
 
 fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
-    // Don't try to render during reinit
-    if REINIT_IN_PROGRESS.load(Ordering::Acquire) {
-        trace!("Skipping render - reinit in progress");
+    // Check for reinit BEFORE trying to initialize or render
+    if REINIT_REQUESTED.load(Ordering::Acquire) {
+        trace!("Skipping render - reinit requested");
         return Ok(());
     }
 
@@ -199,6 +198,11 @@ fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
             state.swap_chain = Some(swap_chain.clone());
         }
         
+        // Don't start initializing if reinit is pending
+        if REINIT_REQUESTED.load(Ordering::Acquire) {
+            return false;
+        }
+        
         if !state.initialized && !state.initializing 
             && state.swap_chain.is_some() 
             && state.command_queue.is_some() {
@@ -211,6 +215,14 @@ fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
     
     if should_init {
         debug!("Both swap chain and command queue available - initializing");
+        
+        // Double-check reinit flag before proceeding with expensive init
+        if REINIT_REQUESTED.load(Ordering::Acquire) {
+            let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+            state.initializing = false;
+            trace!("Aborting init - reinit requested");
+            return Ok(());
+        }
         
         let (sc, cq) = {
             let state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -274,13 +286,11 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
     let _hook_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
     // Handle reinit request - COMPLETE TEARDOWN
+    // Process this FIRST before any rendering attempts
     if REINIT_REQUESTED.compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed).is_ok() {
         debug!("Processing reinit request - FULL TEARDOWN AND REBUILD");
         
-        // Set flag to prevent any rendering during reinit
-        REINIT_IN_PROGRESS.store(true, Ordering::Release);
-        
-        // Wait for rendering to complete
+        // Wait for any in-progress rendering to complete
         let mut wait_count = 0;
         while RENDERING.load(Ordering::Acquire) && wait_count < 1000 {
             std::hint::spin_loop();
@@ -291,43 +301,31 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
             error!("Timeout waiting for rendering to complete during reinit");
         }
         
-        // Get the render loop before we destroy everything
-        let render_loop_arc = RENDER_LOOP.get().expect("Render loop missing");
-        let mut render_loop_guard = render_loop_arc.lock().unwrap();
-        
-        // Only take if present - during first init, pipeline might not have taken it yet
-        let saved_render_loop = if render_loop_guard.is_some() {
-            render_loop_guard.take()
-        } else {
-            warn!("Render loop already taken or not initialized - skipping reinit");
-            REINIT_IN_PROGRESS.store(false, Ordering::Release);
-            let Trampolines { dxgi_swap_chain_present, .. } =
-                TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
-            return dxgi_swap_chain_present(swap_chain, sync_interval, flags);
-        };
-        
-        drop(render_loop_guard);
-        
-        // Now do complete teardown
+        // Now safely perform teardown
         let state_lock = get_render_state();
-        let mut state = state_lock.lock().unwrap_or_else(|e| {
-            error!("Mutex poisoned during reinit, recovering");
-            e.into_inner()
-        });
-        
-        state.full_reset();
-        drop(state);
-        
-        // Put render loop back
-        if let Some(render_loop) = saved_render_loop {
-            let render_loop_arc = RENDER_LOOP.get().unwrap();
-            let mut render_loop_guard = render_loop_arc.lock().unwrap();
-            *render_loop_guard = Some(render_loop);
+        {
+            let mut state = state_lock.lock().unwrap_or_else(|e| {
+                error!("Mutex poisoned during reinit, recovering");
+                e.into_inner()
+            });
+            
+            // Reset state completely - this will drop the pipeline
+            // The pipeline destructor will put the render loop back
+            state.full_reset();
         }
         
-        // Skip frames for stability and clear reinit flag
+        // Verify render loop is back
+        let render_loop_arc = RENDER_LOOP.get().expect("Render loop missing");
+        let render_loop_guard = render_loop_arc.lock().unwrap();
+        if render_loop_guard.is_none() {
+            warn!("Render loop not returned after pipeline drop - this is a bug");
+        } else {
+            debug!("Render loop confirmed available after reinit");
+        }
+        drop(render_loop_guard);
+        
+        // Skip frames for stability
         SKIP_FRAMES.store(90, Ordering::Release);
-        REINIT_IN_PROGRESS.store(false, Ordering::Release);
         debug!("Full reinit complete - everything dropped, will rebuild from scratch");
     }
     
