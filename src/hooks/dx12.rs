@@ -157,13 +157,21 @@ unsafe fn init_pipeline(
         return Err(Error::from_hresult(HRESULT(-1)));
     };
 
-    let pipeline = Pipeline::new(hwnd, ctx, engine, render_loop).map_err(|(e, render_loop)| {
-        RENDER_LOOP.get_or_init(move || render_loop);
-        e
-    })?;
-
-    debug!("Pipeline initialized successfully");
-    Ok(pipeline)
+    // Create pipeline - if it fails, restore the render loop
+    let pipeline_result = Pipeline::new(hwnd, ctx, engine, render_loop);
+    
+    match pipeline_result {
+        Ok(pipeline) => {
+            debug!("Pipeline initialized successfully");
+            Ok(pipeline)
+        }
+        Err((e, render_loop)) => {
+            // Restore render loop so we can retry later
+            RENDER_LOOP.get_or_init(move || render_loop);
+            error!("Failed to create pipeline: {:?}", e);
+            Err(e)
+        }
+    }
 }
 
 fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
