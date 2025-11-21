@@ -225,14 +225,6 @@ fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
                 error!("Failed to initialize pipeline: {:?}", e);
                 let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
                 state.initializing = false;
-                
-                // Put render loop back on failure
-                let render_loop_arc = RENDER_LOOP.get().unwrap();
-                let render_loop_guard = render_loop_arc.lock().unwrap();
-                if render_loop_guard.is_none() {
-                    error!("Render loop was not returned on pipeline init failure!");
-                }
-                
                 return Err(e);
             }
         }
@@ -311,7 +303,7 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
         *render_loop_guard = Some(saved_render_loop);
         
         // Skip frames for stability
-        SKIP_FRAMES.store(90, Ordering::Release); // Extra frames for full rebuild
+        SKIP_FRAMES.store(90, Ordering::Release);
         debug!("Full reinit complete - everything dropped, will rebuild from scratch");
     }
     
@@ -358,10 +350,6 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
                         e.into_inner()
                     });
                     state.reset();
-                    
-                    // Ensure render loop is returned to RENDER_LOOP on panic
-                    // (it may have been taken by init_pipeline before the panic)
-                    // This is a safety measure, though ideally the pipeline error path handles it
                 }
             }
         }
