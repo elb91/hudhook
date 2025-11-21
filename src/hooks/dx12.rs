@@ -386,42 +386,76 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
     result
 }
 
-unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
-    command_queue: ID3D12CommandQueue,
-    num_command_lists: u32,
-    command_lists: *mut ID3D12CommandList,
-) {
+unsafe extern "system" fn dxgi_swap_chain_present_impl(
+    swap_chain: IDXGISwapChain3,
+    sync_interval: u32,
+    flags: u32,
+) -> HRESULT {
     let _hook_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    let desc = command_queue.GetDesc();
+    static mut SKIP_FRAMES: u32 = 60;
     
-    // Only capture DIRECT queues (Type 0)
-    if desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT {
-        let state_lock = get_render_state();
-        if let Ok(mut state) = state_lock.lock() {
-            let queue_ptr = command_queue.as_raw() as *const c_void;
-            
-            // Update command queue if it changed or is unset
-            if state.command_queue_ptr.0 != queue_ptr {
-                if !state.command_queue_ptr.0.is_null() {
-                    debug!(
-                        "Command queue changed: {:p} -> {:p}",
-                        state.command_queue_ptr.0, queue_ptr
-                    );
-                } else {
-                    debug!("First DIRECT queue discovered: {:p}", queue_ptr);
-                }
-                
-                state.command_queue = Some(command_queue.clone());
-                state.command_queue_ptr = SendPtr(queue_ptr);
-            }
-        }
+    // Skip frames if needed
+    if SKIP_FRAMES > 0 {
+        SKIP_FRAMES -= 1;
+        trace!("Skipping frame: {} remaining", SKIP_FRAMES);
+        
+        let Trampolines { dxgi_swap_chain_present, .. } =
+            TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
+        return dxgi_swap_chain_present(swap_chain, sync_interval, flags);
     }
 
-    let Trampolines { d3d12_command_queue_execute_command_lists, .. } =
+    let Trampolines { dxgi_swap_chain_present, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
 
-    d3d12_command_queue_execute_command_lists(command_queue, num_command_lists, command_lists);
+    // Try to render (only one render at a time)
+    if RENDERING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        // Get current command queue 
+        let command_queue = {
+            let state_lock = get_render_state();
+            let state = state_lock.lock().unwrap();
+            state.command_queue.clone()
+        }; // state_lock dropped here
+        
+        if let Some(cq) = command_queue {
+            let render_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                render(&swap_chain, &cq)
+            }));
+            
+            match render_result {
+                Ok(Ok(())) => {
+                    trace!("Frame rendered successfully");
+                },
+                Ok(Err(e)) => {
+                    error!("Render error: {e:?}");
+                    util::print_dxgi_debug_messages();
+                },
+                Err(_) => {
+                    error!("Render panicked - skipping 60 frames");
+                    SKIP_FRAMES = 60;
+                    
+                    // Reset state on panic 
+                    {
+                        let state_lock = get_render_state();
+                        if let Ok(mut state) = state_lock.lock() {
+                            state.reset();
+                        }
+                    } // state_lock dropped here
+                }
+            }
+        }
+        
+        RENDERING.store(false, Ordering::Release);
+    }
+
+    trace!("Calling original Present");
+    let result = dxgi_swap_chain_present(swap_chain, sync_interval, flags);
+
+    if EJECT_REQUESTED.load(Ordering::SeqCst) {
+        perform_eject();
+    }
+
+    result
 }
 
 fn get_target_addrs() -> (
