@@ -260,7 +260,7 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
 
     // Try to render (only one render at a time)
     if RENDERING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-        // Get current command queue - FIX: use a block scope
+        // Get current command queue
         let command_queue = {
             let state_lock = get_render_state();
             let state = state_lock.lock().unwrap();
@@ -269,7 +269,7 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
         
         if let Some(cq) = command_queue {
             let render_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                render(&swap_chain, &cq)
+                render(&swap_chain)
             }));
             
             match render_result {
@@ -284,7 +284,7 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
                     error!("Render panicked - skipping 60 frames");
                     SKIP_FRAMES = 60;
                     
-                    // Reset state on panic - FIX: use a block scope
+                    // Reset state on panic 
                     {
                         let state_lock = get_render_state();
                         if let Ok(mut state) = state_lock.lock() {
