@@ -122,15 +122,14 @@ impl RenderState {
 }
 
 static RENDER_STATE: OnceLock<Arc<Mutex<RenderState>>> = OnceLock::new();
-// Use Option to safely swap the render loop
 static RENDER_LOOP: OnceLock<Arc<Mutex<Option<Box<dyn ImguiRenderLoop + Send + Sync>>>>> = OnceLock::new();
 static RENDERING: AtomicBool = AtomicBool::new(false);
 static SAME_QUEUE_COUNT: AtomicU32 = AtomicU32::new(0);
 static SKIP_FRAMES: AtomicU32 = AtomicU32::new(60);
 static REINIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+static REINIT_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Request a full reinitialization of the rendering pipeline
-/// This will drop everything and rebuild from scratch
 pub fn request_reinit() {
     debug!("Reinit requested by application - will rebuild from scratch");
     REINIT_REQUESTED.store(true, Ordering::Release);
@@ -156,13 +155,14 @@ unsafe fn init_pipeline(
     
     let engine = D3D12RenderEngine::new(command_queue, &mut ctx)?;
 
-    // Get render loop from mutex
     let render_loop_arc = RENDER_LOOP.get().expect("Render loop not initialized");
     let mut render_loop_guard = render_loop_arc.lock().unwrap();
     
-    // Take ownership safely using Option
-    let render_loop_box = render_loop_guard.take()
-        .expect("Render loop already taken");
+    // Check if render loop is available (might be taken during reinit)
+    let Some(render_loop_box) = render_loop_guard.take() else {
+        error!("Render loop not available - possibly taken during reinit");
+        return Err(Error::from_hresult(HRESULT(-1)));
+    };
 
     let pipeline_result = Pipeline::new(hwnd, ctx, engine, render_loop_box);
     
@@ -181,6 +181,12 @@ unsafe fn init_pipeline(
 }
 
 fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
+    // Don't try to render during reinit
+    if REINIT_IN_PROGRESS.load(Ordering::Acquire) {
+        trace!("Skipping render - reinit in progress");
+        return Ok(());
+    }
+
     let state_lock = get_render_state();
     
     let should_init = {
@@ -271,6 +277,9 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
     if REINIT_REQUESTED.compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed).is_ok() {
         debug!("Processing reinit request - FULL TEARDOWN AND REBUILD");
         
+        // Set flag to prevent any rendering during reinit
+        REINIT_IN_PROGRESS.store(true, Ordering::Release);
+        
         // Wait for rendering to complete
         let mut wait_count = 0;
         while RENDERING.load(Ordering::Acquire) && wait_count < 1000 {
@@ -278,13 +287,25 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
             wait_count += 1;
         }
         
+        if wait_count >= 1000 {
+            error!("Timeout waiting for rendering to complete during reinit");
+        }
+        
         // Get the render loop before we destroy everything
         let render_loop_arc = RENDER_LOOP.get().expect("Render loop missing");
         let mut render_loop_guard = render_loop_arc.lock().unwrap();
         
-        // Extract the render loop safely using Option
-        let saved_render_loop = render_loop_guard.take()
-            .expect("Render loop missing during reinit");
+        // Only take if present - during first init, pipeline might not have taken it yet
+        let saved_render_loop = if render_loop_guard.is_some() {
+            render_loop_guard.take()
+        } else {
+            warn!("Render loop already taken or not initialized - skipping reinit");
+            REINIT_IN_PROGRESS.store(false, Ordering::Release);
+            let Trampolines { dxgi_swap_chain_present, .. } =
+                TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
+            return dxgi_swap_chain_present(swap_chain, sync_interval, flags);
+        };
+        
         drop(render_loop_guard);
         
         // Now do complete teardown
@@ -298,12 +319,15 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
         drop(state);
         
         // Put render loop back
-        let render_loop_arc = RENDER_LOOP.get().unwrap();
-        let mut render_loop_guard = render_loop_arc.lock().unwrap();
-        *render_loop_guard = Some(saved_render_loop);
+        if let Some(render_loop) = saved_render_loop {
+            let render_loop_arc = RENDER_LOOP.get().unwrap();
+            let mut render_loop_guard = render_loop_arc.lock().unwrap();
+            *render_loop_guard = Some(render_loop);
+        }
         
-        // Skip frames for stability
+        // Skip frames for stability and clear reinit flag
         SKIP_FRAMES.store(90, Ordering::Release);
+        REINIT_IN_PROGRESS.store(false, Ordering::Release);
         debug!("Full reinit complete - everything dropped, will rebuild from scratch");
     }
     
