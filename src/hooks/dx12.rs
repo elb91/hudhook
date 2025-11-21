@@ -288,7 +288,7 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
                     let state_lock = get_render_state();
                     if let Ok(mut state) = state_lock.lock() {
                         state.reset();
-                    }
+                    };
                 }
             }
         }
