@@ -104,7 +104,7 @@ impl RenderState {
 }
 
 static RENDER_STATE: OnceLock<Arc<Mutex<RenderState>>> = OnceLock::new();
-static RENDER_LOOP: OnceLock<Box<dyn ImguiRenderLoop + Send + Sync>> = OnceLock::new();
+static mut RENDER_LOOP: OnceLock<Box<dyn ImguiRenderLoop + Send + Sync>> = OnceLock::new();
 static RENDERING: AtomicBool = AtomicBool::new(false);
 static SAME_QUEUE_COUNT: AtomicU32 = AtomicU32::new(0);
 static SKIP_FRAMES: AtomicU32 = AtomicU32::new(60);
@@ -445,66 +445,72 @@ fn get_target_addrs() -> (
     DXGISwapChainResizeBuffersType,
     D3D12CommandQueueExecuteCommandListsType,
 ) {
-    debug!("Getting target function addresses");
+    debug!("Getting DirectX 12 vtable addresses");
     
-    unsafe {
-        let hwnd = DummyHwnd::new();
+    let dummy_hwnd = DummyHwnd::new();
 
-        let factory: IDXGIFactory2 = CreateDXGIFactory2(0)
-            .expect("Failed to create DXGI factory");
+    let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(0) }
+        .expect("Failed to create DXGI factory");
+    
+    let adapter = unsafe { factory.EnumAdapters(0) }
+        .expect("Failed to enumerate adapters");
 
-        let device: ID3D12Device = D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0)
-            .expect("Failed to create D3D12 device");
+    let device: ID3D12Device = util::try_out_ptr(|v| unsafe {
+        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, v)
+    })
+    .expect("D3D12CreateDevice failed");
 
-        let queue_desc = D3D12_COMMAND_QUEUE_DESC {
+    let command_queue: ID3D12CommandQueue = unsafe {
+        device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             Priority: 0,
             Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
             NodeMask: 0,
-        };
+        })
+    }
+    .expect("Failed to create command queue");
 
-        let command_queue: ID3D12CommandQueue = device
-            .CreateCommandQueue(&queue_desc)
-            .expect("Failed to create command queue");
-
-        let swap_chain_desc = DXGI_SWAP_CHAIN_DESC {
-            BufferDesc: DXGI_MODE_DESC {
-                Width: 100,
-                Height: 100,
-                RefreshRate: DXGI_RATIONAL {
-                    Numerator: 60,
-                    Denominator: 1,
+    let swap_chain: IDXGISwapChain = util::try_out_ptr(|v| unsafe {
+        factory.CreateSwapChain(
+            &command_queue,
+            &DXGI_SWAP_CHAIN_DESC {
+                BufferDesc: DXGI_MODE_DESC {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    ScanlineOrdering: DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED,
+                    Scaling: DXGI_MODE_SCALING_UNSPECIFIED,
+                    Width: 640,
+                    Height: 480,
+                    RefreshRate: DXGI_RATIONAL {
+                        Numerator: 60,
+                        Denominator: 1,
+                    },
                 },
-                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                ScanlineOrdering: DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED,
-                Scaling: DXGI_MODE_SCALING_UNSPECIFIED,
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: 2,
+                OutputWindow: dummy_hwnd.hwnd(),
+                Windowed: BOOL(1),
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH.0 as _,
             },
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            BufferCount: 2,
-            OutputWindow: hwnd.0,
-            Windowed: BOOL(1),
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-            Flags: DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH.0 as u32,
-        };
+            v,
+        )
+        .ok()
+    })
+    .expect("Failed to create swap chain");
 
-        let mut swap_chain: Option<IDXGISwapChain> = None;
-        factory.CreateSwapChain(&command_queue, &swap_chain_desc, &mut swap_chain)
-            .expect("Failed to create swap chain");
+    unsafe {
+        let sc_vtable = *(swap_chain.as_raw() as *const *const usize);
+        let q_vtable = *(command_queue.as_raw() as *const *const usize);
         
-        let swap_chain: IDXGISwapChain3 = swap_chain
-            .expect("Swap chain is None")
-            .cast()
-            .expect("Failed to cast to IDXGISwapChain3");
-
-        let present_ptr = swap_chain.vtable().Present;
-        let resize_buffers_ptr = swap_chain.vtable().ResizeBuffers;
-        let execute_command_lists_ptr = command_queue.vtable().ExecuteCommandLists;
-
-        debug!("Target addresses:");
+        let present_ptr = *sc_vtable.add(8);
+        let resize_buffers_ptr = *sc_vtable.add(13);
+        let execute_command_lists_ptr = *q_vtable.add(10);
+        
+        debug!("Vtable addresses extracted:");
         debug!("  Present:              {:p}", present_ptr as *const c_void);
         debug!("  ResizeBuffers:        {:p}", resize_buffers_ptr as *const c_void);
         debug!("  ExecuteCommandLists:  {:p}", execute_command_lists_ptr as *const c_void);
