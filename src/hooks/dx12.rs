@@ -70,6 +70,10 @@ struct RenderState {
     first_queue_ptr: SendPtr,
 }
 
+// Manual Send/Sync implementation - we ensure thread safety through Mutex
+unsafe impl Send for RenderState {}
+unsafe impl Sync for RenderState {}
+
 impl RenderState {
     fn new() -> Self {
         Self {
@@ -85,11 +89,17 @@ impl RenderState {
 
     fn reset(&mut self) {
         debug!("Resetting render state");
-        self.pipeline = None;
+        
+        if let Some(mut pipeline) = self.pipeline.take() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pipeline.cleanup();
+            }));
+        }
+        
+        self.swap_chain = None;
+        self.command_queue = None;
         self.initialized = false;
         self.initializing = false;
-        self.command_queue = None;
-        self.swap_chain = None;
     }
 }
 
@@ -105,41 +115,76 @@ fn get_render_state() -> Arc<Mutex<RenderState>> {
         .clone()
 }
 
+unsafe fn init_pipeline(
+    swap_chain: &IDXGISwapChain3,
+    command_queue: &ID3D12CommandQueue,
+) -> Result<Pipeline<D3D12RenderEngine>> {
+    debug!("Initializing rendering pipeline");
+    
+    let hwnd = util::try_out_param(|v| swap_chain.GetDesc(v))
+        .map(|desc| desc.OutputWindow)?;
+
+    let mut ctx = Context::create();
+    ctx.set_ini_filename(None);
+    
+    let engine = D3D12RenderEngine::new(command_queue, &mut ctx)?;
+
+    let Some(render_loop) = RENDER_LOOP.take() else {
+        error!("Render loop not initialized");
+        return Err(Error::from_hresult(HRESULT(-1)));
+    };
+
+    let pipeline = Pipeline::new(hwnd, ctx, engine, render_loop).map_err(|(e, render_loop)| {
+        RENDER_LOOP.get_or_init(move || render_loop);
+        e
+    })?;
+
+    debug!("Pipeline initialized successfully");
+    Ok(pipeline)
+}
+
 fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
     let state_lock = get_render_state();
-    let mut state = state_lock.lock().unwrap_or_else(|e| {
-        error!("Mutex poisoned, recovering");
-        e.into_inner()
-    });
-
-    // Store swap chain reference if not already stored
-    if state.swap_chain.is_none() {
-        state.swap_chain = Some(swap_chain.clone());
-    }
-
-    // Initialize pipeline if needed
-    if !state.initialized && !state.initializing {
-        state.initializing = true;
+    
+    // Check if we should initialize (without holding lock for long)
+    let should_init = {
+        let mut state = state_lock.lock().unwrap_or_else(|e| {
+            error!("Mutex poisoned during init check, recovering");
+            e.into_inner()
+        });
         
-        let command_queue = match &state.command_queue {
-            Some(cq) => cq.clone(),
-            None => {
-                error!("No command queue available");
-                state.initializing = false;
-                return Ok(());
-            }
+        // Update swap chain if needed
+        if state.swap_chain.is_none() {
+            state.swap_chain = Some(swap_chain.clone());
+        }
+        
+        // Check if we should start initialization
+        if !state.initialized && !state.initializing 
+            && state.swap_chain.is_some() 
+            && state.command_queue.is_some() {
+            state.initializing = true;
+            true
+        } else {
+            false
+        }
+    };
+    
+    if should_init {
+        debug!("Both swap chain and command queue available - initializing");
+        
+        // Get resources without holding the lock
+        let (sc, cq) = {
+            let state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+            (state.swap_chain.clone().unwrap(), state.command_queue.clone().unwrap())
         };
-
-        debug!("Initializing pipeline");
         
-        let render_loop = RENDER_LOOP.get().expect("Render loop not initialized");
+        // Initialize pipeline WITHOUT holding lock (prevents deadlock)
+        let init_result = unsafe { init_pipeline(&sc, &cq) };
         
-        match Pipeline::new(
-            swap_chain.clone(),
-            command_queue,
-            render_loop.as_ref(),
-        ) {
+        // Store result while holding lock
+        match init_result {
             Ok(pipeline) => {
+                let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
                 state.pipeline = Some(pipeline);
                 state.initialized = true;
                 state.initializing = false;
@@ -147,6 +192,7 @@ fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
             }
             Err(e) => {
                 error!("Failed to initialize pipeline: {:?}", e);
+                let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
                 state.initializing = false;
                 return Err(e);
             }
@@ -154,13 +200,28 @@ fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
     }
     
     // Check if we're ready to render
-    if !state.initialized || state.initializing {
+    let can_render = {
+        let state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        state.initialized && !state.initializing
+    };
+    
+    if !can_render {
         trace!("Waiting for initialization");
         return Ok(());
     }
     
-    // Render while holding the lock to prevent race conditions
-    if let Some(pipeline) = state.pipeline.as_mut() {
+    // Get raw pointer to pipeline while holding lock
+    let pipeline_ptr = {
+        let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        state.pipeline.as_mut().map(|p| p as *mut Pipeline<D3D12RenderEngine>)
+    };
+    
+    // Render using the raw pointer
+    // SAFETY: We hold RENDERING flag, preventing ResizeBuffers from destroying pipeline
+    // The pipeline remains valid because reset() is only called when RENDERING is false
+    if let Some(pipeline_ptr) = pipeline_ptr {
+        let pipeline = unsafe { &mut *pipeline_ptr };
+        
         pipeline.prepare_render()?;
         
         let target: ID3D12Resource = unsafe {
@@ -196,14 +257,14 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
 
     // Try to acquire render lock (only one render at a time)
     if RENDERING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-        // Check if command queue is valid
-        let has_valid_queue = {
+        // Get current command queue to check validity
+        let command_queue = {
             let state_lock = get_render_state();
             let state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
-            state.command_queue.is_some()
+            state.command_queue.clone()
         };
         
-        if has_valid_queue {
+        if let Some(cq) = command_queue {
             let render_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 render(&swap_chain)
             }));
@@ -222,14 +283,11 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
                     
                     // Always reset state on panic, even if mutex is poisoned
                     let state_lock = get_render_state();
-                    match state_lock.lock() {
-                        Ok(mut state) => state.reset(),
-                        Err(e) => {
-                            error!("Mutex poisoned during panic recovery, forcing reset");
-                            let mut state = e.into_inner();
-                            state.reset();
-                        }
-                    }
+                    let mut state = state_lock.lock().unwrap_or_else(|e| {
+                        error!("Mutex poisoned during panic recovery");
+                        e.into_inner()
+                    });
+                    state.reset();
                 }
             }
         }
@@ -275,16 +333,12 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
     
     // Now safe to reset state
     let state_lock = get_render_state();
-    match state_lock.lock() {
-        Ok(mut state) => {
-            state.reset();
-        }
-        Err(e) => {
-            error!("Mutex poisoned in ResizeBuffers, recovering");
-            let mut state = e.into_inner();
-            state.reset();
-        }
-    }
+    let mut state = state_lock.lock().unwrap_or_else(|e| {
+        error!("Mutex poisoned in ResizeBuffers, recovering");
+        e.into_inner()
+    });
+    state.reset();
+    drop(state);
     
     let Trampolines { dxgi_swap_chain_resize_buffers, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
@@ -320,19 +374,18 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
     // Only capture DIRECT queues (Type 0)
     if desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT {
         let state_lock = get_render_state();
-        let mut state = match state_lock.lock() {
-            Ok(guard) => guard,
-            Err(e) => {
-                error!("Mutex poisoned in ExecuteCommandLists, recovering");
-                e.into_inner()
-            }
-        };
+        let mut state = state_lock.lock().unwrap_or_else(|e| {
+            error!("Mutex poisoned in ExecuteCommandLists, recovering");
+            e.into_inner()
+        });
         
         let queue_ptr = command_queue.as_raw() as *const c_void;
         
         // Validate pointer is not null
         if queue_ptr.is_null() {
             error!("Command queue pointer is null");
+            drop(state);
+            
             let Trampolines { d3d12_command_queue_execute_command_lists, .. } =
                 TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
             d3d12_command_queue_execute_command_lists(command_queue, num_command_lists, command_lists);
@@ -378,7 +431,6 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
             }
         }
         
-        // Explicitly drop the lock before calling trampoline
         drop(state);
     }
 
@@ -398,14 +450,11 @@ fn get_target_addrs() -> (
     unsafe {
         let hwnd = DummyHwnd::new();
 
-        let mut factory: Option<IDXGIFactory2> = None;
-        CreateDXGIFactory2(0, &mut factory).expect("Failed to create DXGI factory");
-        let factory = factory.expect("Factory is None");
+        let factory: IDXGIFactory2 = CreateDXGIFactory2(0)
+            .expect("Failed to create DXGI factory");
 
-        let mut device: Option<ID3D12Device> = None;
-        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut device)
+        let device: ID3D12Device = D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0)
             .expect("Failed to create D3D12 device");
-        let device = device.expect("Device is None");
 
         let queue_desc = D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -436,17 +485,18 @@ fn get_target_addrs() -> (
             },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: 2,
-            OutputWindow: *hwnd,
+            OutputWindow: hwnd.0,
             Windowed: BOOL(1),
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
             Flags: DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH.0 as u32,
         };
 
-        let swap_chain: IDXGISwapChain = factory
-            .CreateSwapChain(&command_queue, &swap_chain_desc)
+        let mut swap_chain: Option<IDXGISwapChain> = None;
+        factory.CreateSwapChain(&command_queue, &swap_chain_desc, &mut swap_chain)
             .expect("Failed to create swap chain");
-
+        
         let swap_chain: IDXGISwapChain3 = swap_chain
+            .expect("Swap chain is None")
             .cast()
             .expect("Failed to cast to IDXGISwapChain3");
 
@@ -533,16 +583,13 @@ impl Hooks for ImguiDx12Hooks {
         }
         
         let state_lock = get_render_state();
-        match state_lock.lock() {
-            Ok(mut state) => state.reset(),
-            Err(e) => {
-                error!("Mutex poisoned during unhook, recovering");
-                let mut state = e.into_inner();
-                state.reset();
-            }
-        }
+        let mut state = state_lock.lock().unwrap_or_else(|e| {
+            error!("Mutex poisoned during unhook, recovering");
+            e.into_inner()
+        });
+        state.reset();
+        drop(state);
         
-        RENDER_LOOP.take();
         RENDERING.store(false, Ordering::Release);
         
         debug!("DirectX 12 unhook complete");
