@@ -100,7 +100,7 @@ impl RenderState {
     }
     
     fn full_reset(&mut self) {
-        debug!("Full reset - dropping everything");
+        debug!("Full reset - dropping DirectX resources (keeping render loop)");
         
         if let Some(mut pipeline) = self.pipeline.take() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -108,12 +108,16 @@ impl RenderState {
             }));
         }
         
+        // Drop DirectX resources
         self.swap_chain = None;
         self.command_queue = None;
         self.initialized = false;
         self.initializing = false;
         self.queue_discovery_complete = false;
         self.first_queue_ptr = SendPtr(std::ptr::null());
+        
+        // IMPORTANT: We do NOT touch RENDER_LOOP here
+        // It stays in the OnceLock and gets reused on reinit
     }
 }
 
@@ -164,6 +168,7 @@ unsafe fn init_pipeline(
             Ok(pipeline)
         }
         Err((e, render_loop)) => {
+            // Put render loop back so it can be reused
             RENDER_LOOP.get_or_init(move || render_loop);
             error!("Failed to create pipeline: {:?}", e);
             Err(e)
