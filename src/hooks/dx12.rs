@@ -96,8 +96,9 @@ impl RenderState {
             }));
         }
         
-        self.swap_chain = None;
-        self.command_queue = None;
+        // IMPORTANT: Keep swap_chain and command_queue - only reset pipeline
+        // self.swap_chain = None;  // DON'T RESET THIS
+        // self.command_queue = None;  // DON'T RESET THIS
         self.initialized = false;
         self.initializing = false;
     }
@@ -168,7 +169,7 @@ unsafe fn init_pipeline(
 fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
     // Check for game transition - if detected, reset and skip
     if check_game_transition() {
-        debug!("Game transition detected - skipping render");
+        trace!("Game transition active - skipping render");
         let state_lock = get_render_state();
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
         if state.initialized {
