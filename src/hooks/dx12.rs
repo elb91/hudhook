@@ -109,6 +109,28 @@ static RENDERING: AtomicBool = AtomicBool::new(false);
 static SAME_QUEUE_COUNT: AtomicU32 = AtomicU32::new(0);
 static SKIP_FRAMES: AtomicU32 = AtomicU32::new(60);
 
+// Optional callback that the application can set to detect transitions
+static mut TRANSITION_DETECTOR: Option<fn() -> bool> = None;
+
+/// Allows the application to provide a transition detection callback
+/// Call this from your main app initialization: 
+/// `hudhook::hooks::dx12::set_transition_detector(your_app::is_game_transitioning);`
+pub fn set_transition_detector(detector: fn() -> bool) {
+    unsafe {
+        TRANSITION_DETECTOR = Some(detector);
+    }
+}
+
+fn check_game_transition() -> bool {
+    unsafe {
+        if let Some(detector) = TRANSITION_DETECTOR {
+            detector()
+        } else {
+            false
+        }
+    }
+}
+
 fn get_render_state() -> Arc<Mutex<RenderState>> {
     RENDER_STATE
         .get_or_init(|| Arc::new(Mutex::new(RenderState::new())))
@@ -144,6 +166,17 @@ unsafe fn init_pipeline(
 }
 
 fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
+    // Check for game transition - if detected, reset and skip
+    if check_game_transition() {
+        debug!("Game transition detected - skipping render");
+        let state_lock = get_render_state();
+        let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if state.initialized {
+            state.reset();
+        }
+        return Ok(());
+    }
+    
     let state_lock = get_render_state();
     
     // Check if we should initialize (without holding lock for long)
@@ -356,7 +389,8 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
     if result.is_err() {
         error!("ResizeBuffers failed: {:?}", result);
     } else {
-        debug!("ResizeBuffers succeeded");
+        debug!("ResizeBuffers succeeded - skipping 30 frames for stability");
+        SKIP_FRAMES.store(30, Ordering::Release);
     }
     
     result
