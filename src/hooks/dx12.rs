@@ -1,4 +1,4 @@
-//! DirectX 12 hooks 
+//! DirectX 12 hooks with simple reinit flag
 
 use std::ffi::c_void;
 use std::mem;
@@ -70,7 +70,6 @@ struct RenderState {
     first_queue_ptr: SendPtr,
 }
 
-// Manual Send/Sync implementation - we ensure thread safety through Mutex
 unsafe impl Send for RenderState {}
 unsafe impl Sync for RenderState {}
 
@@ -96,11 +95,25 @@ impl RenderState {
             }));
         }
         
-        // IMPORTANT: Keep swap_chain and command_queue - only reset pipeline
-        // self.swap_chain = None;  // DON'T RESET THIS
-        // self.command_queue = None;  // DON'T RESET THIS
         self.initialized = false;
         self.initializing = false;
+    }
+    
+    fn full_reset(&mut self) {
+        debug!("Full reset - dropping everything");
+        
+        if let Some(mut pipeline) = self.pipeline.take() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pipeline.cleanup();
+            }));
+        }
+        
+        self.swap_chain = None;
+        self.command_queue = None;
+        self.initialized = false;
+        self.initializing = false;
+        self.queue_discovery_complete = false;
+        self.first_queue_ptr = SendPtr(std::ptr::null());
     }
 }
 
@@ -109,27 +122,13 @@ static mut RENDER_LOOP: OnceLock<Box<dyn ImguiRenderLoop + Send + Sync>> = OnceL
 static RENDERING: AtomicBool = AtomicBool::new(false);
 static SAME_QUEUE_COUNT: AtomicU32 = AtomicU32::new(0);
 static SKIP_FRAMES: AtomicU32 = AtomicU32::new(60);
+static REINIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-// Optional callback that the application can set to detect transitions
-static mut TRANSITION_DETECTOR: Option<fn() -> bool> = None;
-
-/// Allows the application to provide a transition detection callback
-/// Call this from your main app initialization: 
-/// `hudhook::hooks::dx12::set_transition_detector(your_app::is_game_transitioning);`
-pub fn set_transition_detector(detector: fn() -> bool) {
-    unsafe {
-        TRANSITION_DETECTOR = Some(detector);
-    }
-}
-
-fn check_game_transition() -> bool {
-    unsafe {
-        if let Some(detector) = TRANSITION_DETECTOR {
-            detector()
-        } else {
-            false
-        }
-    }
+/// Request a full reinitialization of the rendering pipeline
+/// Call this from your app when you detect first game: `hudhook::hooks::dx12::request_reinit();`
+pub fn request_reinit() {
+    debug!("Reinit requested by application");
+    REINIT_REQUESTED.store(true, Ordering::Release);
 }
 
 fn get_render_state() -> Arc<Mutex<RenderState>> {
@@ -157,7 +156,6 @@ unsafe fn init_pipeline(
         return Err(Error::from_hresult(HRESULT(-1)));
     };
 
-    // Create pipeline - if it fails, restore the render loop
     let pipeline_result = Pipeline::new(hwnd, ctx, engine, render_loop);
     
     match pipeline_result {
@@ -166,7 +164,6 @@ unsafe fn init_pipeline(
             Ok(pipeline)
         }
         Err((e, render_loop)) => {
-            // Restore render loop so we can retry later
             RENDER_LOOP.get_or_init(move || render_loop);
             error!("Failed to create pipeline: {:?}", e);
             Err(e)
@@ -175,27 +172,18 @@ unsafe fn init_pipeline(
 }
 
 fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
-    // Check for game transition - if detected, just skip rendering but DON'T reset pipeline
-    if check_game_transition() {
-        trace!("Game transition active - skipping render");
-        return Ok(());
-    }
-    
     let state_lock = get_render_state();
     
-    // Check if we should initialize (without holding lock for long)
     let should_init = {
         let mut state = state_lock.lock().unwrap_or_else(|e| {
             error!("Mutex poisoned during init check, recovering");
             e.into_inner()
         });
         
-        // Update swap chain if needed
         if state.swap_chain.is_none() {
             state.swap_chain = Some(swap_chain.clone());
         }
         
-        // Check if we should start initialization
         if !state.initialized && !state.initializing 
             && state.swap_chain.is_some() 
             && state.command_queue.is_some() {
@@ -209,16 +197,13 @@ fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
     if should_init {
         debug!("Both swap chain and command queue available - initializing");
         
-        // Get resources without holding the lock
         let (sc, cq) = {
             let state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
             (state.swap_chain.clone().unwrap(), state.command_queue.clone().unwrap())
         };
         
-        // Initialize pipeline WITHOUT holding lock (prevents deadlock)
         let init_result = unsafe { init_pipeline(&sc, &cq) };
         
-        // Store result while holding lock
         match init_result {
             Ok(pipeline) => {
                 let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -236,7 +221,6 @@ fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
         }
     }
     
-    // Check if we're ready to render
     let can_render = {
         let state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
         state.initialized && !state.initializing
@@ -247,15 +231,11 @@ fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
         return Ok(());
     }
     
-    // Get raw pointer to pipeline while holding lock
     let pipeline_ptr = {
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
         state.pipeline.as_mut().map(|p| p as *mut Pipeline<D3D12RenderEngine>)
     };
     
-    // Render using the raw pointer
-    // SAFETY: We hold RENDERING flag, preventing ResizeBuffers from destroying pipeline
-    // The pipeline remains valid because reset() is only called when RENDERING is false
     if let Some(pipeline_ptr) = pipeline_ptr {
         let pipeline = unsafe { &mut *pipeline_ptr };
         
@@ -278,7 +258,31 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
 ) -> HRESULT {
     let _hook_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    // Skip frames if needed (using atomic operations)
+    // Handle reinit request
+    if REINIT_REQUESTED.compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        debug!("Processing reinit request - full reset");
+        
+        // Wait for rendering to complete
+        let mut wait_count = 0;
+        while RENDERING.load(Ordering::Acquire) && wait_count < 1000 {
+            std::hint::spin_loop();
+            wait_count += 1;
+        }
+        
+        let state_lock = get_render_state();
+        let mut state = state_lock.lock().unwrap_or_else(|e| {
+            error!("Mutex poisoned during reinit, recovering");
+            e.into_inner()
+        });
+        
+        state.full_reset();
+        drop(state);
+        
+        // Skip frames for stability
+        SKIP_FRAMES.store(60, Ordering::Release);
+        debug!("Full reinit complete - skipping 60 frames");
+    }
+    
     let skip = SKIP_FRAMES.load(Ordering::Acquire);
     if skip > 0 {
         SKIP_FRAMES.fetch_sub(1, Ordering::Release);
@@ -292,9 +296,7 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
     let Trampolines { dxgi_swap_chain_present, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
 
-    // Try to acquire render lock (only one render at a time)
     if RENDERING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-        // Get current command queue to check validity
         let command_queue = {
             let state_lock = get_render_state();
             let state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -318,7 +320,6 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
                     error!("Render panicked - skipping 60 frames and resetting state");
                     SKIP_FRAMES.store(60, Ordering::Release);
                     
-                    // Always reset state on panic, even if mutex is poisoned
                     let state_lock = get_render_state();
                     let mut state = state_lock.lock().unwrap_or_else(|e| {
                         error!("Mutex poisoned during panic recovery");
@@ -357,7 +358,6 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
         width, height, buffer_count, new_format
     );
     
-    // Wait for any active rendering to complete (with timeout)
     let mut wait_count = 0;
     while RENDERING.load(Ordering::Acquire) && wait_count < 1000 {
         std::hint::spin_loop();
@@ -368,7 +368,6 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
         error!("Timeout waiting for render completion");
     }
     
-    // Now safe to reset state
     let state_lock = get_render_state();
     let mut state = state_lock.lock().unwrap_or_else(|e| {
         error!("Mutex poisoned in ResizeBuffers, recovering");
@@ -409,7 +408,6 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
     
     let desc = command_queue.GetDesc();
     
-    // Only capture DIRECT queues (Type 0)
     if desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT {
         let state_lock = get_render_state();
         let mut state = state_lock.lock().unwrap_or_else(|e| {
@@ -419,7 +417,6 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
         
         let queue_ptr = command_queue.as_raw() as *const c_void;
         
-        // Validate pointer is not null
         if queue_ptr.is_null() {
             error!("Command queue pointer is null");
             drop(state);
@@ -430,7 +427,6 @@ unsafe extern "system" fn d3d12_command_queue_execute_command_lists_impl(
             return;
         }
         
-        // Queue discovery phase
         if !state.queue_discovery_complete {
             if state.command_queue.is_none() {
                 debug!(
@@ -619,7 +615,6 @@ impl Hooks for ImguiDx12Hooks {
     unsafe fn unhook(&mut self) {
         debug!("Unhooking DirectX 12");
         
-        // Wait for rendering to complete
         let mut wait_count = 0;
         while RENDERING.load(Ordering::Acquire) && wait_count < 1000 {
             std::hint::spin_loop();
