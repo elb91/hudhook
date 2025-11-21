@@ -91,6 +91,14 @@ impl RenderState {
         debug!("Resetting render state");
         
         if let Some(mut pipeline) = self.pipeline.take() {
+            // CRITICAL: Extract render loop before cleanup so we can reuse it
+            unsafe {
+                if let Some(render_loop) = pipeline.take_render_loop() {
+                    debug!("Extracted render loop from pipeline before cleanup");
+                    RENDER_LOOP.get_or_init(|| render_loop);
+                }
+            }
+            
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 pipeline.cleanup();
             }));
