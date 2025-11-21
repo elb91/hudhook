@@ -1,4 +1,4 @@
-//! DirectX 12 hooks with simple reinit flag
+//! DirectX 12 hooks with forced reinit on first game
 
 use std::ffi::c_void;
 use std::mem;
@@ -87,7 +87,7 @@ impl RenderState {
     }
 
     fn reset(&mut self) {
-        debug!("Resetting render state");
+        debug!("Resetting render state (pipeline only)");
         
         if let Some(mut pipeline) = self.pipeline.take() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -100,7 +100,7 @@ impl RenderState {
     }
     
     fn full_reset(&mut self) {
-        debug!("Full reset - dropping DirectX resources (keeping render loop)");
+        debug!("Full reset - dropping everything for fresh rebuild");
         
         if let Some(mut pipeline) = self.pipeline.take() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -108,28 +108,31 @@ impl RenderState {
             }));
         }
         
-        // Drop DirectX resources
+        // Drop everything
         self.swap_chain = None;
         self.command_queue = None;
         self.initialized = false;
         self.initializing = false;
         self.queue_discovery_complete = false;
         self.first_queue_ptr = SendPtr(std::ptr::null());
+        
+        // Reset queue discovery counters
+        SAME_QUEUE_COUNT.store(0, Ordering::Release);
     }
 }
 
 static RENDER_STATE: OnceLock<Arc<Mutex<RenderState>>> = OnceLock::new();
-// CHANGED: Use Arc<Mutex<>> instead of OnceLock so we can borrow without consuming
-static RENDER_LOOP: OnceLock<Arc<Mutex<Option<Box<dyn ImguiRenderLoop + Send + Sync>>>>> = OnceLock::new();
+// Use Mutex to allow swapping the render loop
+static RENDER_LOOP: OnceLock<Arc<Mutex<Box<dyn ImguiRenderLoop + Send + Sync>>>> = OnceLock::new();
 static RENDERING: AtomicBool = AtomicBool::new(false);
 static SAME_QUEUE_COUNT: AtomicU32 = AtomicU32::new(0);
 static SKIP_FRAMES: AtomicU32 = AtomicU32::new(60);
 static REINIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Request a full reinitialization of the rendering pipeline
-/// Call this from your app when you detect first game: `hudhook::hooks::dx12::request_reinit();`
+/// This will drop everything and rebuild from scratch
 pub fn request_reinit() {
-    debug!("Reinit requested by application");
+    debug!("Reinit requested by application - will rebuild from scratch");
     REINIT_REQUESTED.store(true, Ordering::Release);
 }
 
@@ -153,25 +156,23 @@ unsafe fn init_pipeline(
     
     let engine = D3D12RenderEngine::new(command_queue, &mut ctx)?;
 
-    // Get render loop from the Arc<Mutex<>>
+    // Get render loop from mutex
     let render_loop_arc = RENDER_LOOP.get().expect("Render loop not initialized");
-    let mut render_loop_guard = render_loop_arc.lock().unwrap();
+    let mut render_loop = render_loop_arc.lock().unwrap();
     
-    let Some(render_loop) = render_loop_guard.take() else {
-        error!("Render loop already taken");
-        return Err(Error::from_hresult(HRESULT(-1)));
-    };
+    // Take ownership temporarily
+    let render_loop_box = mem::replace(&mut *render_loop, unsafe { mem::zeroed() });
 
-    let pipeline_result = Pipeline::new(hwnd, ctx, engine, render_loop);
+    let pipeline_result = Pipeline::new(hwnd, ctx, engine, render_loop_box);
     
     match pipeline_result {
         Ok(pipeline) => {
             debug!("Pipeline initialized successfully");
             Ok(pipeline)
         }
-        Err((e, render_loop)) => {
-            // Put render loop back
-            *render_loop_guard = Some(render_loop);
+        Err((e, returned_render_loop)) => {
+            // Put it back
+            *render_loop = returned_render_loop;
             error!("Failed to create pipeline: {:?}", e);
             Err(e)
         }
@@ -265,9 +266,9 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
 ) -> HRESULT {
     let _hook_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     
-    // Handle reinit request
+    // Handle reinit request - COMPLETE TEARDOWN
     if REINIT_REQUESTED.compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-        debug!("Processing reinit request - full reset");
+        debug!("Processing reinit request - FULL TEARDOWN AND REBUILD");
         
         // Wait for rendering to complete
         let mut wait_count = 0;
@@ -276,6 +277,15 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
             wait_count += 1;
         }
         
+        // Get the render loop before we destroy everything
+        let render_loop_arc = RENDER_LOOP.get().expect("Render loop missing");
+        let mut render_loop_guard = render_loop_arc.lock().unwrap();
+        
+        // Extract the render loop temporarily (this is the trick!)
+        let saved_render_loop = mem::replace(&mut *render_loop_guard, unsafe { mem::zeroed() });
+        drop(render_loop_guard);
+        
+        // Now do complete teardown
         let state_lock = get_render_state();
         let mut state = state_lock.lock().unwrap_or_else(|e| {
             error!("Mutex poisoned during reinit, recovering");
@@ -285,9 +295,14 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
         state.full_reset();
         drop(state);
         
+        // Put render loop back
+        let render_loop_arc = RENDER_LOOP.get().unwrap();
+        let mut render_loop_guard = render_loop_arc.lock().unwrap();
+        *render_loop_guard = saved_render_loop;
+        
         // Skip frames for stability
-        SKIP_FRAMES.store(60, Ordering::Release);
-        debug!("Full reinit complete - skipping 60 frames");
+        SKIP_FRAMES.store(90, Ordering::Release); // Extra frames for full rebuild
+        debug!("Full reinit complete - everything dropped, will rebuild from scratch");
     }
     
     let skip = SKIP_FRAMES.load(Ordering::Acquire);
@@ -593,8 +608,8 @@ impl ImguiDx12Hooks {
         )
         .expect("Failed to create ExecuteCommandLists hook");
 
-        // Initialize with Arc<Mutex<Option<>>>
-        RENDER_LOOP.get_or_init(|| Arc::new(Mutex::new(Some(Box::new(t)))));
+        // Initialize with Arc<Mutex<>> so we can swap it later
+        RENDER_LOOP.get_or_init(|| Arc::new(Mutex::new(Box::new(t))));
 
         TRAMPOLINES.get_or_init(|| Trampolines {
             dxgi_swap_chain_present: mem::transmute(hook_present.trampoline()),
