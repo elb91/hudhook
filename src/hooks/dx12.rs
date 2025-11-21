@@ -91,14 +91,6 @@ impl RenderState {
         debug!("Resetting render state");
         
         if let Some(mut pipeline) = self.pipeline.take() {
-            // CRITICAL: Extract render loop before cleanup so we can reuse it
-            unsafe {
-                if let Some(render_loop) = pipeline.take_render_loop() {
-                    debug!("Extracted render loop from pipeline before cleanup");
-                    RENDER_LOOP.get_or_init(|| render_loop);
-                }
-            }
-            
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 pipeline.cleanup();
             }));
@@ -183,14 +175,9 @@ unsafe fn init_pipeline(
 }
 
 fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
-    // Check for game transition - if detected, reset and skip
+    // Check for game transition - if detected, just skip rendering but DON'T reset pipeline
     if check_game_transition() {
         trace!("Game transition active - skipping render");
-        let state_lock = get_render_state();
-        let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if state.initialized {
-            state.reset();
-        }
         return Ok(());
     }
     
