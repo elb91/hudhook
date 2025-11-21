@@ -115,14 +115,12 @@ impl RenderState {
         self.initializing = false;
         self.queue_discovery_complete = false;
         self.first_queue_ptr = SendPtr(std::ptr::null());
-        
-        // IMPORTANT: We do NOT touch RENDER_LOOP here
-        // It stays in the OnceLock and gets reused on reinit
     }
 }
 
 static RENDER_STATE: OnceLock<Arc<Mutex<RenderState>>> = OnceLock::new();
-static mut RENDER_LOOP: OnceLock<Box<dyn ImguiRenderLoop + Send + Sync>> = OnceLock::new();
+// CHANGED: Use Arc<Mutex<>> instead of OnceLock so we can borrow without consuming
+static RENDER_LOOP: OnceLock<Arc<Mutex<Option<Box<dyn ImguiRenderLoop + Send + Sync>>>>> = OnceLock::new();
 static RENDERING: AtomicBool = AtomicBool::new(false);
 static SAME_QUEUE_COUNT: AtomicU32 = AtomicU32::new(0);
 static SKIP_FRAMES: AtomicU32 = AtomicU32::new(60);
@@ -155,8 +153,12 @@ unsafe fn init_pipeline(
     
     let engine = D3D12RenderEngine::new(command_queue, &mut ctx)?;
 
-    let Some(render_loop) = RENDER_LOOP.take() else {
-        error!("Render loop not initialized");
+    // Get render loop from the Arc<Mutex<>>
+    let render_loop_arc = RENDER_LOOP.get().expect("Render loop not initialized");
+    let mut render_loop_guard = render_loop_arc.lock().unwrap();
+    
+    let Some(render_loop) = render_loop_guard.take() else {
+        error!("Render loop already taken");
         return Err(Error::from_hresult(HRESULT(-1)));
     };
 
@@ -168,8 +170,8 @@ unsafe fn init_pipeline(
             Ok(pipeline)
         }
         Err((e, render_loop)) => {
-            // Put render loop back so it can be reused
-            RENDER_LOOP.get_or_init(move || render_loop);
+            // Put render loop back
+            *render_loop_guard = Some(render_loop);
             error!("Failed to create pipeline: {:?}", e);
             Err(e)
         }
@@ -591,7 +593,8 @@ impl ImguiDx12Hooks {
         )
         .expect("Failed to create ExecuteCommandLists hook");
 
-        RENDER_LOOP.get_or_init(|| Box::new(t));
+        // Initialize with Arc<Mutex<Option<>>>
+        RENDER_LOOP.get_or_init(|| Arc::new(Mutex::new(Some(Box::new(t)))));
 
         TRAMPOLINES.get_or_init(|| Trampolines {
             dxgi_swap_chain_present: mem::transmute(hook_present.trampoline()),
